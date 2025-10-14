@@ -1,19 +1,16 @@
-// app/api/debug/openai/route.js
-import OpenAI from "openai";
+// app/api/debug/sadia/route.js
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+import { generateReplyLLM } from "../../../lib/sadia-ai.js";
 
 export async function GET() {
   try {
-    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    const model = (process.env.OPENAI_MODEL || "gpt-4o-mini").trim();
-    const r = await client.responses.create({
-      model,
-      input: [{ role: "user", content: "ping" }],
-      max_output_tokens: 1,
+    const reply = await generateReplyLLM({
+      psid: "test-web",
+      userText: "hi, amar naam test. ajke kemon jachhe?"
     });
     return new Response(JSON.stringify({
-      ok: true, model, text: r.output_text
+      ok: reply != null, reply
     }), { status: 200, headers: { "content-type": "application/json" }});
   } catch (e) {
     return new Response(JSON.stringify({

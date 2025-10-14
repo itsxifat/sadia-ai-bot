@@ -1,11 +1,10 @@
-// app/api/chat/route.js
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 import { generateReplyLLM } from "../../lib/sadia-ai.js";
-
 const CHAT_API_TOKEN = process.env.CHAT_API_TOKEN || "";
 const ALLOW_ORIGIN = process.env.CORS_ORIGIN || "*";
+const DEBUG = process.env.DEBUG === "1";
 
 const hits = new Map();
 function rateLimit(ip, limit = 10, windowMs = 10_000) {
@@ -54,12 +53,16 @@ export async function POST(req) {
     try { body = await req.json(); } catch {}
     const userText = String(body?.userText || "").trim();
     const psid = body?.psid ? String(body.psid) : undefined;
-
     if (!userText) return json({ error: "userText is required" }, 400, headers);
 
     const reply = await generateReplyLLM({ psid, userText });
-    if (reply == null) return json({ reply: "Ekto tech jhamela hocche. Ektu pore abar try kori? 🙂" }, 200, headers);
 
+    // If Sadia returned null, show soft line + optional debug hint
+    if (reply == null) {
+      const payload = { reply: "Ekto tech jhamela hocche. Ektu pore abar try kori? 🙂" };
+      if (DEBUG) payload.hint = "Sadia returned null (OpenAI error or missing env). Check /api/debug/openai.";
+      return json(payload, 200, headers);
+    }
     return json({ reply }, 200, headers);
   } catch (e) {
     console.error("[CHAT route error]", e);
