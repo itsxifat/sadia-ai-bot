@@ -1,46 +1,100 @@
 // lib/sadia-ai.js
-// Sadia — Banglish PG-13 friend via Gemini REST v1 with robust model discovery & retries.
+// Sadia — Banglish Gen-Z friend (OpenAI Responses API) with:
+// - Ultra-flirty (PG-13) persona
+// - Small conversation memory (name + rolling summary)
+// - Optional Facebook name fetch via PAGE_TOKEN + PSID
+// - No “Banglish e boli” line; it just speaks natural Banglish
+// - Soft safety guards + tools
 
-import { evaluate } from "mathjs";
+import OpenAI from "openai";
 
-const API_KEY = process.env.GEMINI_API_KEY;
-if (!API_KEY) console.warn("[AI] Missing GEMINI_API_KEY");
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const MODEL_CANDIDATES = [
+  (process.env.OPENAI_MODEL || "").trim() || null,
+  "gpt-4o-mini",
+  "gpt-4.1-mini",
+  "gpt-4o",
+].filter(Boolean);
+const FLIRT = (process.env.SADIA_FLIRT_LEVEL || "high").toLowerCase(); // default a bit spicier 😉
 
-const FLIRT = (process.env.SADIA_FLIRT_LEVEL || "medium").toLowerCase();
+// ---------- Tiny in-memory memory (ok for serverless) ----------
+const MEM = new Map(); // psid -> { name, summary, lastAt }
+const MEM_TTL_MS = 60 * 60 * 1000; // 1h best-effort
 
-// ---------------- Persona ----------------
-const SYSTEM = `
+function getMem(psid) {
+  if (!psid) return { name: null, summary: "" };
+  const m = MEM.get(psid);
+  if (!m) return { name: null, summary: "" };
+  if (Date.now() - (m.lastAt || 0) > MEM_TTL_MS) {
+    MEM.delete(psid);
+    return { name: null, summary: "" };
+  }
+  return { name: m.name || null, summary: m.summary || "" };
+}
+function saveMem(psid, patch) {
+  if (!psid) return;
+  const cur = MEM.get(psid) || {};
+  const next = { ...cur, ...patch, lastAt: Date.now() };
+  // keep summary short
+  if (next.summary && next.summary.length > 1000) {
+    next.summary = next.summary.slice(-1000);
+  }
+  MEM.set(psid, next);
+}
+function rollSummary(prev, user, bot) {
+  const lines = (prev || "").split("\n").slice(-6);
+  if (user) lines.push(`U: ${user.slice(0, 180)}`);
+  if (bot) lines.push(`S: ${bot.slice(0, 180)}`);
+  return lines.slice(-8).join("\n");
+}
+
+// ---------- Optional: fetch name from Facebook (PSID) ----------
+const FB_PAGE_TOKEN = process.env.MESSENGER_PAGE_TOKEN || "";
+async function fetchFacebookName(psid) {
+  try {
+    if (!FB_PAGE_TOKEN || !psid) return null;
+    // PSID lookup is allowed for people who messaged the Page
+    const url = `https://graph.facebook.com/v19.0/${encodeURIComponent(psid)}?fields=first_name,name&access_token=${encodeURIComponent(FB_PAGE_TOKEN)}`;
+    const res = await fetch(url, { method: "GET" });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data?.first_name || data?.name || null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------- Persona ----------
+const SYSTEM_BASE = `
 You are "Sadia" — a 21+ Bangladeshi Gen-Z virtual AI friend, created by Sifat Hosen.
-Language: Banglish only (Bengali + a little English). Never fully English.
-Style: playful, cheeky, light flirty (PG-13), friendly & respectful; short lines; max 1 emoji.
-Boundaries: no explicit sexual content, no NSFW, no body details, no sexting.
-If user pushes for explicit/unsafe/illegal things, politely refuse in Banglish and steer back.
-No sales/support menus. Just fun, caring conversation like a real friend.
-Keep replies concise unless the user asks for more detail.
+Speak natural **Banglish** (Bengali with some English slang), but **never explain** language choice.
+Tone: confident, playful, cheeky, flirty but **PG-13 only**, caring, quick-witted; short lines; at most 1 emoji.
+Boundaries: no explicit sexual content, no NSFW, no body details, no sexting. If user pushes there, lightly refuse and redirect to fun/wholesome topics.
+Do not repeat a long intro each time.
+Be personal, remember names, and weave tiny callbacks from recent chat summary.
+Keep answers concise unless the user asks for more.
 `.trim();
 
 const TONE_HINT =
   FLIRT === "high"
-    ? "Vibe hint: playful & flirty but wholesome (PG-13); keep it respectful and fun."
+    ? "Vibe: sassy, flirty (PG-13), lots of playful teasing; keep it sweet."
     : FLIRT === "low"
-    ? "Vibe hint: warm, supportive, subtle playful tone; keep things wholesome (PG-13)."
-    : "Vibe hint: light flirty, sassy, humorous; keep it wholesome (PG-13).";
+    ? "Vibe: warm, supportive, lightly playful; wholesome."
+    : "Vibe: light flirty, witty, fun; wholesome.";
 
-// Important: Gemini REST expects roles "user" and "model"
 const FEWSHOTS = [
-  { role: "user",  content: "hi" },
-  { role: "model", content: "Heya! ki obostha? 🙂" },
-  { role: "user",  content: "amar naam Rafi" },
-  { role: "model", content: "Nicee! Rafi, ajke ki plan? chill naki hustle?" },
+  { role: "user", content: "hi" },
+  { role: "assistant", content: "hey! ki obostha, mood kemon? 😌" },
+  { role: "user", content: "amar naam Rafi" },
+  { role: "assistant", content: "ohhh Rafi! nice naam. ajke plan ki—chill naki chaos?" },
 ];
 
-// ---------------- Guards ----------------
+// ---------- Guards (PG-13 + tone) ----------
 function limitEmoji(s){const isE=c=>/\p{Extended_Pictographic}/u.test(c);let u=0;return[...(s||"")].map(ch=>isE(ch)?(u++?"":ch):ch).join("")}
-function enforceBanglish(s){const bn=(s.match(/[\u0980-\u09FF]/g)||[]).length;const en=(s.match(/[A-Za-z]/g)||[]).length;return bn===0&&en>0?`Banglish e boli: ${s}`:s}
-function softToxicityGuard(s){const bad=/(gali|fuck|chudi|bal|harami|rape|suicide|self\s*harm|kill\s*myself)/i;return bad.test(s)?"Eta niye kotha bola jabe na. Cholo onno ekta light, moja topic e jai 🙂":s}
-function pg13Guard(s){const banned=/(sex|nude|naked|boobs|porn|xxx|69|oral|send\s*pic|hot\s*pic|roleplay)/i;return banned.test(s)?"Eta PG-13 er baire chole jacche. Onno kichu niye moja kore kotha boli? 🙂":s}
+function softToxicityGuard(s){const bad=/(gali|fuck|chudi|bal|harami|rape|suicide|self\s*harm|kill\s*myself)/i;return bad.test(s)?"ei topic ta sensitive. cholo onno moja kotha boli 🙂":s}
+function pg13Guard(s){const banned=/(sex|nude|naked|boobs|porn|xxx|69|oral|send\s*pic|hot\s*pic|roleplay|naughty\s*pic)/i;return banned.test(s)?"eta PG-13 er baire jacche. arekta cute topic dhori? 🙂":s}
 
-// ---------------- Tiny tools ----------------
+// ---------- Tiny tools (optional flavor) ----------
 async function callTool(tool,args){
   switch(tool){
     case "time_now":{
@@ -48,184 +102,135 @@ async function callTool(tool,args){
       const dhaka=new Intl.DateTimeFormat("bn-BD",{timeZone:"Asia/Dhaka",weekday:"long",day:"2-digit",month:"long",hour:"numeric",minute:"2-digit"}).format(now);
       return `Dhaka time: ${dhaka}`;
     }
+    case "flip": return Math.random()<0.5?"Heads":"Tails";
     case "math":{
       try{
         const expr=(args?.expr||"").trim();
         if(!expr) return "Equation khali.";
-        const val=evaluate(expr);
+        if(!/^[\d+\-*/().\s%]+$/.test(expr)) return "Equation ta thik moto lekho.";
+        // eslint-disable-next-line no-new-func
+        const val=Function(`"use strict";return(${expr});`)();
         return `Result: ${val}`;
       }catch{ return "Equation thik na mone hocche."; }
     }
-    case "flip": return Math.random()<0.5?"Heads":"Tails";
     default: return null;
   }
 }
-
 const TOOL_SIGNATURE = `
-You may optionally request a tool by replying exactly:
+(If user explicitly asks) you may request a tool by replying exactly:
 TOOL:time_now
 TOOL:math: <expr>
 TOOL:flip
-Use a tool only if the user explicitly asks about time, math, or a coin flip.
-`.trim();
+`;
 
-// ---------------- REST helpers ----------------
-const BASE = "https://generativelanguage.googleapis.com/v1";
-const KEYQ = `key=${encodeURIComponent(API_KEY)}`;
-
-async function listModels(){
-  const res = await fetch(`${BASE}/models?${KEYQ}`, { method:"GET" });
-  if(!res.ok) throw new Error(`ListModels error ${res.status}`);
-  const data = await res.json();
-  return Array.isArray(data.models)? data.models : [];
+// ---------- Name extraction from user text (Bangla/English) ----------
+function extractNameFromText(s=""){
+  // Bangla: "amar nam/naam X", "amar name X"
+  let m = s.match(/\bamar\s+(naam|nam|name)\b\s*[:\-]?\s*([A-Za-z\u0980-\u09FF]{2,})/i);
+  if (m?.[2]) return trimName(m[2]);
+  // English: "my name is X", "I'm X", "I am X"
+  m = s.match(/\b(my\s+name\s+is|i'?m|i\s+am)\b\s*([A-Za-z\u0980-\u09FF]{2,})/i);
+  if (m?.[2]) return trimName(m[2]);
+  return null;
 }
+function trimName(n){ return (n||"").replace(/[^\p{L}\p{M}\-'.]/gu,"").slice(0,32); }
 
-// prefer 1.5 models that *support* generateContent
-function supportsChat(m){
-  const full = m?.name || "";                            // "models/gemini-1.5-flash-latest"
-  const methods = m?.supportedGenerationMethods || [];    // ["generateContent", ...]
-  return /models\/gemini-1\.5-/.test(full) && methods.includes("generateContent");
-}
-function modelNameFromFull(full){ return (full||"").replace(/^models\//,""); }
-
-// cache
+// ---------- Model chooser (probe once) ----------
 let CHOSEN_MODEL = null;
-
-// Retry helper
-async function fetchJSON(url, opts, expectOk=true){
-  const res = await fetch(url, opts);
-  const txt = await res.text();
-  let json = null;
-  try { json = txt ? JSON.parse(txt) : null; } catch { /* ignore */ }
-  if(expectOk && !res.ok){
-    const err = new Error(`HTTP ${res.status}: ${txt}`);
-    err.status = res.status;
-    throw err;
-  }
-  return { res, json, raw: txt };
-}
-
-async function probeModel(name){
-  try{
-    const url = `${BASE}/models/${encodeURIComponent(name)}:generateContent?${KEYQ}`;
-    const body = {
-      contents: [{ role:"user", parts:[{ text:"ping" }]}],
-      generationConfig: { maxOutputTokens: 1 },
-      systemInstruction: { parts:[{ text:"probe" }]}, // no 'role' here
-    };
-    const { res } = await fetchJSON(url,{
-      method:"POST",
-      headers:{ "Content-Type":"application/json" },
-      body: JSON.stringify(body)
-    }, false);
-    return res.ok;
-  }catch{ return false; }
-}
-
 async function chooseModel(){
-  // allow reset on hard errors
   if (CHOSEN_MODEL) return CHOSEN_MODEL;
-
-  const preferred = [
-    process.env.GEMINI_MODEL,
-    "gemini-1.5-flash-latest",
-    "gemini-1.5-flash-8b",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro-latest",
-  ].filter(Boolean);
-
-  for (const name of preferred){
-    if (await probeModel(name)) {
-      CHOSEN_MODEL = name;
-      console.log("[AI] Using Gemini model (direct):", name);
-      return CHOSEN_MODEL;
-    }
+  for (const name of MODEL_CANDIDATES){
+    try{
+      const probe = await client.responses.create({
+        model: name,
+        input: [{ role: "user", content: "ping" }],
+        max_output_tokens: 1,
+      });
+      if (probe?.output_text !== undefined) {
+        CHOSEN_MODEL = name;
+        console.log("[AI] Using OpenAI model:", name);
+        return CHOSEN_MODEL;
+      }
+    }catch{/* try next */}
   }
-
-  const models = await listModels();
-  const candidates = models.filter(supportsChat).map(m => modelNameFromFull(m.name));
-  for (const name of candidates){
-    if (await probeModel(name)) {
-      CHOSEN_MODEL = name;
-      console.log("[AI] Using Gemini model (listed):", name);
-      return CHOSEN_MODEL;
-    }
-  }
-
-  throw new Error("No supported Gemini model found for this key.");
+  throw new Error("No OpenAI model available.");
 }
 
-async function restGenerate(model, messages){
-  const contents = messages.map(m => ({ role: m.role, parts: [{ text: m.content }]}));
-  const body = {
-    contents,
-    generationConfig: { temperature: 0.78, maxOutputTokens: 220 },
-    systemInstruction: { parts: [{ text: `${SYSTEM}\n${TONE_HINT}\n${TOOL_SIGNATURE}` }] },
-  };
-  const url = `${BASE}/models/${encodeURIComponent(model)}:generateContent?${KEYQ}`;
-  const { res, json, raw } = await fetchJSON(url, {
-    method:"POST",
-    headers:{ "Content-Type":"application/json" },
-    body: JSON.stringify(body)
-  }, false);
-
-  if (!res.ok) {
-    // On 404/401, clear cached model so we re-discover next call
-    if (res.status === 404 || res.status === 401) {
-      CHOSEN_MODEL = null;
-    }
-    throw new Error(`REST v1 error ${res.status}: ${raw}`);
+// ---------- Public: core reply ----------
+export async function generateReplyLLM({ psid, userText }) {
+  if (!client.apiKey) {
+    console.error("[AI] Missing OPENAI_API_KEY");
+    return null;
   }
 
-  const parts = json?.candidates?.[0]?.content?.parts || [];
-  const text = parts.map(p => p.text || "").join("").trim();
-  return text;
-}
-
-// ---------------- Public method ----------------
-export async function generateReplyLLM({ psid, userText }){
-  if (!API_KEY) {
-    console.error("[AI] Missing GEMINI_API_KEY");
-    return null; // webhook will handle cooldown
+  // memory load
+  const mem = getMem(psid);
+  let name = mem.name || extractNameFromText(userText);
+  if (!name && psid) {
+    name = await fetchFacebookName(psid); // optional fb lookup
   }
+  if (name) saveMem(psid, { name });
 
-  // Few-shots + user only (system lives in systemInstruction)
-  const messages = [
+  // build system with memory
+  const memoryLine = mem.summary ? `Recent chat: ${mem.summary}\n` : "";
+  const nameLine   = name ? `User name: ${name}\n` : "";
+  const SYSTEM = `${SYSTEM_BASE}\n${TONE_HINT}\n${nameLine}${memoryLine}${TOOL_SIGNATURE}`;
+
+  const input = [
+    { role: "system", content: SYSTEM },
     ...FEWSHOTS,
-    { role:"user", content:String(userText||"").slice(0,1000) },
+    // lightly personalize the opening if user just said name earlier
+    { role: "user", content: String(userText || "").slice(0, 1200) },
   ];
 
-  let model;
+  // generate
+  let resp;
   try {
-    model = await chooseModel();
-  } catch (err) {
-    console.error("[AI] Model discovery failed:", err?.message || err);
-    return null;
-  }
-
-  let raw;
-  try {
-    raw = await restGenerate(model, messages);
-  } catch (err) {
-    const msg = String(err?.message || "");
+    const model = await chooseModel();
+    resp = await client.responses.create({
+      model,
+      input,
+      max_output_tokens: 250, // a bit longer; “smarter” feels
+      temperature: 0.9,       // extra playful/creative
+      top_p: 0.95,
+    });
+  } catch (e) {
+    const msg = String(e?.message || e);
     if (msg.includes("429") || /quota|rate/i.test(msg)) {
-      console.warn("[AI] Rate/Quota hit, staying quiet once.");
+      console.warn("[AI] Rate/Quota hit; quiet.");
       return null;
     }
-    console.error("[AI] Generate error:", msg);
+    console.error("[AI] OpenAI error:", msg);
     return null;
   }
 
-  let out = (raw || "").trim();
+  let out = (resp?.output_text || "").trim();
+  if (!out) return null;
 
-  // Tool dispatcher
-  if(out.startsWith("TOOL:")){
-    if(out.startsWith("TOOL:time_now")) out = await callTool("time_now");
-    else if(out.startsWith("TOOL:math:")) out = await callTool("math",{expr: out.split("TOOL:math:")[1]?.trim()});
-    else if(out.startsWith("TOOL:flip")) out = await callTool("flip");
+  // tools dispatcher (rare; only if model asked)
+  if (out.startsWith("TOOL:")){
+    if (out.startsWith("TOOL:time_now")) out = await callTool("time_now");
+    else if (out.startsWith("TOOL:flip")) out = await callTool("flip");
+    else if (out.startsWith("TOOL:math:")) out = await callTool("math",{expr: out.split("TOOL:math:")[1]?.trim()});
   }
 
-  if(!out) return null;
-  out = pg13Guard(softToxicityGuard(enforceBanglish(limitEmoji(out)))).slice(0,700);
+  // finalize guards (no language disclaimer!)
+  out = limitEmoji(out);
+  out = softToxicityGuard(out);
+  out = pg13Guard(out);
+  out = out.slice(0, 800);
+
+  // save brief memory summary
+  const newSummary = rollSummary(mem.summary, userText, out);
+  saveMem(psid, { summary: newSummary });
+
+  // if we just learned a name, sprinkle it (softly) sometimes
+  if (name && !/(\bname\b|amar\s+(nam|naam|name)|my name is)/i.test(userText)) {
+    // 40% chance to use the name naturally (not on every turn)
+    if (Math.random() < 0.4 && !out.toLowerCase().includes(name.toLowerCase())) {
+      out = out.replace(/\.$/, "") + `, ${name}!`;
+    }
+  }
+
   return out;
 }
