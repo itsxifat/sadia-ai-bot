@@ -1,9 +1,6 @@
-import React from 'react'
+import { redirect } from "next/navigation";
 
-const page = () => {
-  return (
-    <div>page</div>
-  )
+export default function Home() {
+  redirect("/chat"); // instant server-side redirect
+  return null;
 }
-
-export default page
