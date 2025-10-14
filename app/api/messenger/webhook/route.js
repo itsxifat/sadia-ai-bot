@@ -1,4 +1,4 @@
-import { generateReplyLLM } from "@/lib/ai";
+import { generateReplyLLM } from "../../../lib/ai";
 
 const PAGE_TOKEN = process.env.MESSENGER_PAGE_TOKEN;
 const VERIFY_TOKEN = process.env.MESSENGER_VERIFY_TOKEN;
