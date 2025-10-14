@@ -1,9 +1,11 @@
 // lib/sadia-ai.js
 // Sadia — Banglish PG-13 friend on Gemini REST v1 with dynamic model discovery.
-// Corrections applied:
-//  - systemInstruction has NO 'role' property (only parts[]).
-//  - contents has NO 'system' message; we keep few-shots + user.
-//  - probeModel simplified to return res.ok.
+// - NO v1beta usage.
+// - Discovers a supported model via /v1/models, caches it in memory.
+// - Robust 404/rate-limit handling; quiet fallback to avoid spam.
+// - Tiny local tools + safety guards.
+
+import { evaluate } from 'mathjs'; // 💡 IMPROVEMENT: For safe math evaluation
 
 const API_KEY = process.env.GEMINI_API_KEY;
 if (!API_KEY) console.warn("[AI] Missing GEMINI_API_KEY");
@@ -28,11 +30,12 @@ const TONE_HINT =
     ? "Vibe hint: warm, supportive, subtle playful tone; keep things wholesome (PG-13)."
     : "Vibe hint: light flirty, sassy, humorous; keep it wholesome (PG-13).";
 
+// ✅ FIXED: The role for the AI's responses must be "model", not "assistant".
 const FEWSHOTS = [
   { role: "user", content: "hi" },
-  { role: "assistant", content: "Heya! ki obostha? 🙂" },
+  { role: "model", content: "Heya! ki obostha? 🙂" },
   { role: "user", content: "amar naam Rafi" },
-  { role: "assistant", content: "Nicee! Rafi, ajke ki plan? chill naki hustle?" },
+  { role: "model", content: "Nicee! Rafi, ajke ki plan? chill naki hustle?" },
 ];
 
 // ---------------- Guards ----------------
@@ -50,12 +53,17 @@ async function callTool(tool,args){
       return `Dhaka time: ${dhaka}`;
     }
     case "math":{
-      try{
-        if(!/^[\d+\-*/().\s%]+$/.test(args?.expr||"")) return "Equation bujhlam na.";
-        // eslint-disable-next-line no-new-func
-        const val=Function(`"use strict";return(${args.expr});`)();
+      // 💡 IMPROVEMENT: Switched from Function() to a safe math library (math.js)
+      // This prevents potential code injection vulnerabilities.
+      // You will need to run: npm install mathjs
+      try {
+        const expr = args?.expr || "";
+        if (!expr) return "Equation khali.";
+        const val = evaluate(expr);
         return `Result: ${val}`;
-      }catch{return "Equation thik na mone hocche.";}
+      } catch {
+        return "Equation thik na mone hocche.";
+      }
     }
     case "flip": return Math.random()<0.5?"Heads":"Tails";
     default: return null;
@@ -80,22 +88,20 @@ async function listModels(){
 }
 
 function supportsChat(m){
-  // Prefer Gemini 1.5 family for chat
-  const name = m?.name || ""; // e.g. "models/gemini-1.5-flash-latest"
+  const name = m?.name || "";
   return /models\/gemini-1\.5-/.test(name);
 }
 function modelNameFromFull(full){ return (full||"").replace(/^models\//,""); }
 
-// cache chosen model in-memory
 let CHOSEN_MODEL = null;
 
 async function chooseModel(){
   if (CHOSEN_MODEL) return CHOSEN_MODEL;
 
+  // 💡 IMPROVEMENT: Cleaned up model list to standard names.
   const preferred = [
-    process.env.GEMINI_MODEL,                 // env preference, e.g. gemini-1.5-flash-latest
+    process.env.GEMINI_MODEL,
     "gemini-1.5-flash-latest",
-    "gemini-1.5-flash-8b",
     "gemini-1.5-flash",
     "gemini-1.5-pro-latest"
   ].filter(Boolean);
@@ -120,7 +126,6 @@ async function chooseModel(){
   throw new Error("No supported Gemini model found for this key.");
 }
 
-// CORRECTED: probeModel with no 'role' in systemInstruction
 async function probeModel(model){
   try{
     const url = `https://generativelanguage.googleapis.com/v1/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(API_KEY)}`;
@@ -134,7 +139,6 @@ async function probeModel(model){
   }catch{ return false; }
 }
 
-// CORRECTED: systemInstruction has no role; contents has no 'system' message
 async function restGenerate(model, messages){
   const contents = messages.map(m => ({ role: m.role, parts: [{ text: m.content }]}));
   const body = {
@@ -158,10 +162,9 @@ async function restGenerate(model, messages){
 export async function generateReplyLLM({ psid, userText }){
   if (!API_KEY) {
     console.error("[AI] Missing GEMINI_API_KEY");
-    return null; // webhook will cooldown & avoid spam
+    return null;
   }
 
-  // CORRECTED: no 'system' message here (few-shots + user only)
   const messages = [
     ...FEWSHOTS,
     { role:"user", content:String(userText||"").slice(0,1000) },
@@ -190,14 +193,13 @@ export async function generateReplyLLM({ psid, userText }){
 
   let out = (raw || "").trim();
 
-  // Tool dispatcher
   if(out.startsWith("TOOL:")){
     if(out.startsWith("TOOL:time_now")) out = await callTool("time_now");
     else if(out.startsWith("TOOL:math:")) out = await callTool("math",{expr: out.split("TOOL:math:")[1]?.trim()});
     else if(out.startsWith("TOOL:flip")) out = await callTool("flip");
   }
 
-  if(!out) return null; // quiet on empty to avoid spam
+  if(!out) return null;
   out = pg13Guard(softToxicityGuard(enforceBanglish(limitEmoji(out)))).slice(0,700);
   return out;
 }
