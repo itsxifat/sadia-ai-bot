@@ -1,11 +1,7 @@
 // lib/sadia-ai.js
-// Sadia — Banglish PG-13 friend on Gemini REST v1 with dynamic model discovery.
-// - NO v1beta usage.
-// - Discovers a supported model via /v1/models, caches it in memory.
-// - Robust 404/rate-limit handling; quiet fallback to avoid spam.
-// - Tiny local tools + safety guards.
+// Sadia — Banglish PG-13 friend via Gemini REST v1 with robust model discovery & retries.
 
-import { evaluate } from 'mathjs'; // 💡 IMPROVEMENT: For safe math evaluation
+import { evaluate } from "mathjs";
 
 const API_KEY = process.env.GEMINI_API_KEY;
 if (!API_KEY) console.warn("[AI] Missing GEMINI_API_KEY");
@@ -30,11 +26,11 @@ const TONE_HINT =
     ? "Vibe hint: warm, supportive, subtle playful tone; keep things wholesome (PG-13)."
     : "Vibe hint: light flirty, sassy, humorous; keep it wholesome (PG-13).";
 
-// ✅ FIXED: The role for the AI's responses must be "model", not "assistant".
+// Important: Gemini REST expects roles "user" and "model"
 const FEWSHOTS = [
-  { role: "user", content: "hi" },
+  { role: "user",  content: "hi" },
   { role: "model", content: "Heya! ki obostha? 🙂" },
-  { role: "user", content: "amar naam Rafi" },
+  { role: "user",  content: "amar naam Rafi" },
   { role: "model", content: "Nicee! Rafi, ajke ki plan? chill naki hustle?" },
 ];
 
@@ -53,17 +49,12 @@ async function callTool(tool,args){
       return `Dhaka time: ${dhaka}`;
     }
     case "math":{
-      // 💡 IMPROVEMENT: Switched from Function() to a safe math library (math.js)
-      // This prevents potential code injection vulnerabilities.
-      // You will need to run: npm install mathjs
-      try {
-        const expr = args?.expr || "";
-        if (!expr) return "Equation khali.";
-        const val = evaluate(expr);
+      try{
+        const expr=(args?.expr||"").trim();
+        if(!expr) return "Equation khali.";
+        const val=evaluate(expr);
         return `Result: ${val}`;
-      } catch {
-        return "Equation thik na mone hocche.";
-      }
+      }catch{ return "Equation thik na mone hocche."; }
     }
     case "flip": return Math.random()<0.5?"Heads":"Tails";
     default: return null;
@@ -79,31 +70,68 @@ Use a tool only if the user explicitly asks about time, math, or a coin flip.
 `.trim();
 
 // ---------------- REST helpers ----------------
+const BASE = "https://generativelanguage.googleapis.com/v1";
+const KEYQ = `key=${encodeURIComponent(API_KEY)}`;
+
 async function listModels(){
-  const url = `https://generativelanguage.googleapis.com/v1/models?key=${encodeURIComponent(API_KEY)}`;
-  const res = await fetch(url, { method:"GET" });
+  const res = await fetch(`${BASE}/models?${KEYQ}`, { method:"GET" });
   if(!res.ok) throw new Error(`ListModels error ${res.status}`);
   const data = await res.json();
   return Array.isArray(data.models)? data.models : [];
 }
 
+// prefer 1.5 models that *support* generateContent
 function supportsChat(m){
-  const name = m?.name || "";
-  return /models\/gemini-1\.5-/.test(name);
+  const full = m?.name || "";                            // "models/gemini-1.5-flash-latest"
+  const methods = m?.supportedGenerationMethods || [];    // ["generateContent", ...]
+  return /models\/gemini-1\.5-/.test(full) && methods.includes("generateContent");
 }
 function modelNameFromFull(full){ return (full||"").replace(/^models\//,""); }
 
+// cache
 let CHOSEN_MODEL = null;
 
+// Retry helper
+async function fetchJSON(url, opts, expectOk=true){
+  const res = await fetch(url, opts);
+  const txt = await res.text();
+  let json = null;
+  try { json = txt ? JSON.parse(txt) : null; } catch { /* ignore */ }
+  if(expectOk && !res.ok){
+    const err = new Error(`HTTP ${res.status}: ${txt}`);
+    err.status = res.status;
+    throw err;
+  }
+  return { res, json, raw: txt };
+}
+
+async function probeModel(name){
+  try{
+    const url = `${BASE}/models/${encodeURIComponent(name)}:generateContent?${KEYQ}`;
+    const body = {
+      contents: [{ role:"user", parts:[{ text:"ping" }]}],
+      generationConfig: { maxOutputTokens: 1 },
+      systemInstruction: { parts:[{ text:"probe" }]}, // no 'role' here
+    };
+    const { res } = await fetchJSON(url,{
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify(body)
+    }, false);
+    return res.ok;
+  }catch{ return false; }
+}
+
 async function chooseModel(){
+  // allow reset on hard errors
   if (CHOSEN_MODEL) return CHOSEN_MODEL;
 
-  // 💡 IMPROVEMENT: Cleaned up model list to standard names.
   const preferred = [
     process.env.GEMINI_MODEL,
     "gemini-1.5-flash-latest",
+    "gemini-1.5-flash-8b",
     "gemini-1.5-flash",
-    "gemini-1.5-pro-latest"
+    "gemini-1.5-pro-latest",
   ].filter(Boolean);
 
   for (const name of preferred){
@@ -123,20 +151,8 @@ async function chooseModel(){
       return CHOSEN_MODEL;
     }
   }
-  throw new Error("No supported Gemini model found for this key.");
-}
 
-async function probeModel(model){
-  try{
-    const url = `https://generativelanguage.googleapis.com/v1/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(API_KEY)}`;
-    const body = {
-      contents: [{ role:"user", parts:[{ text:"ping" }]}],
-      generationConfig: { maxOutputTokens: 1 },
-      systemInstruction: { parts:[{ text:"probe" }]},
-    };
-    const res = await fetch(url,{ method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body) });
-    return res.ok;
-  }catch{ return false; }
+  throw new Error("No supported Gemini model found for this key.");
 }
 
 async function restGenerate(model, messages){
@@ -146,14 +162,22 @@ async function restGenerate(model, messages){
     generationConfig: { temperature: 0.78, maxOutputTokens: 220 },
     systemInstruction: { parts: [{ text: `${SYSTEM}\n${TONE_HINT}\n${TOOL_SIGNATURE}` }] },
   };
-  const url = `https://generativelanguage.googleapis.com/v1/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(API_KEY)}`;
-  const res = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body) });
+  const url = `${BASE}/models/${encodeURIComponent(model)}:generateContent?${KEYQ}`;
+  const { res, json, raw } = await fetchJSON(url, {
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify(body)
+  }, false);
+
   if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`REST v1 error ${res.status}: ${txt}`);
+    // On 404/401, clear cached model so we re-discover next call
+    if (res.status === 404 || res.status === 401) {
+      CHOSEN_MODEL = null;
+    }
+    throw new Error(`REST v1 error ${res.status}: ${raw}`);
   }
-  const data = await res.json();
-  const parts = data?.candidates?.[0]?.content?.parts || [];
+
+  const parts = json?.candidates?.[0]?.content?.parts || [];
   const text = parts.map(p => p.text || "").join("").trim();
   return text;
 }
@@ -162,9 +186,10 @@ async function restGenerate(model, messages){
 export async function generateReplyLLM({ psid, userText }){
   if (!API_KEY) {
     console.error("[AI] Missing GEMINI_API_KEY");
-    return null;
+    return null; // webhook will handle cooldown
   }
 
+  // Few-shots + user only (system lives in systemInstruction)
   const messages = [
     ...FEWSHOTS,
     { role:"user", content:String(userText||"").slice(0,1000) },
@@ -193,6 +218,7 @@ export async function generateReplyLLM({ psid, userText }){
 
   let out = (raw || "").trim();
 
+  // Tool dispatcher
   if(out.startsWith("TOOL:")){
     if(out.startsWith("TOOL:time_now")) out = await callTool("time_now");
     else if(out.startsWith("TOOL:math:")) out = await callTool("math",{expr: out.split("TOOL:math:")[1]?.trim()});
