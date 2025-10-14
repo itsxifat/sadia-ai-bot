@@ -1,20 +1,14 @@
 // app/api/messenger/webhook/route.js
-import { generateReplyLLM } from "../../../lib/ai.js"; // <-- keep .js and relative path
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-export const runtime = "nodejs"; // ensure Node runtime on Vercel
+import { generateReplyLLM } from "../../../lib/ai.js";
 
 const PAGE_TOKEN = process.env.MESSENGER_PAGE_TOKEN;
 const VERIFY_TOKEN = process.env.MESSENGER_VERIFY_TOKEN;
 
-// Guard: fail fast if token missing (shows up in logs)
-function assertEnv() {
-  if (!PAGE_TOKEN || !VERIFY_TOKEN) {
-    console.error("Missing Messenger env vars");
-  }
-}
-assertEnv();
+function log(...a){ console.log("[WEBHOOK]", ...a); }
 
-// Ignore Messenger's "echo" messages (messages sent by the Page itself)
 function isEcho(evt) {
   return Boolean(evt.message?.is_echo);
 }
@@ -27,10 +21,11 @@ async function fbSend(body) {
     body: JSON.stringify(body),
     cache: "no-store",
   });
-  if (!res.ok) {
-    const err = await res.text();
-    console.error("SendAPI error:", res.status, err, "BODY:", JSON.stringify(body));
-  }
+  const ok = res.ok;
+  const txt = await res.text();
+  if (!ok) console.error("[SendAPI error]", res.status, txt, "BODY:", JSON.stringify(body));
+  else log("[SendAPI ok]", txt);
+  return ok;
 }
 
 async function sendTyping(psid, on = true) {
@@ -45,33 +40,38 @@ async function humanPause(text) {
   await new Promise(r => setTimeout(r, ms));
 }
 
-// Webhook verify
-export async function GET(request) {
-  const { searchParams } = new URL(request.url);
+// VERIFY
+export async function GET(req) {
+  const { searchParams } = new URL(req.url);
   const mode = searchParams.get("hub.mode");
   const token = searchParams.get("hub.verify_token");
   const challenge = searchParams.get("hub.challenge");
+  log("GET verify", { mode, tokenOk: token === VERIFY_TOKEN });
   if (mode === "subscribe" && token === VERIFY_TOKEN) return new Response(challenge, { status: 200 });
   return new Response("Forbidden", { status: 403 });
 }
 
-// Webhook receive
-export async function POST(request) {
+// RECEIVE
+export async function POST(req) {
   try {
-    const body = await request.json();
+    const body = await req.json();
+    log("POST body.object", body.object);
+
     if (body.object !== "page") return new Response("Not a page object", { status: 404 });
 
     for (const entry of body.entry || []) {
       for (const evt of entry.messaging || []) {
-        if (isEcho(evt)) continue; // avoid infinite loops
+        if (isEcho(evt)) { log("skip echo"); continue; }
 
         const psid = evt.sender?.id;
         const textIn = evt.message?.text?.trim();
+        log("event", { psid, textIn });
+
         if (!psid || !textIn) continue;
 
-        // reply
         await sendTyping(psid, true);
         const reply = await generateReplyLLM({ psid, userText: textIn });
+        log("reply", reply);
         await humanPause(reply);
         await sendText(psid, reply);
         await sendTyping(psid, false);
@@ -79,7 +79,7 @@ export async function POST(request) {
     }
     return new Response("EVENT_RECEIVED", { status: 200 });
   } catch (e) {
-    console.error("Webhook POST error:", e);
+    console.error("[WEBHOOK error]", e);
     return new Response("Bad Request", { status: 400 });
   }
 }
