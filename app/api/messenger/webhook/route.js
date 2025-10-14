@@ -1,7 +1,7 @@
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-import { generateReplyLLM } from "../../../../lib/sadia-ai.js"; // Adjusted path for clarity
+import { generateReplyLLM } from "../../../lib/sadia-ai"; // Adjusted path for clarity
 
 const PAGE_TOKEN = process.env.MESSENGER_PAGE_TOKEN;
 const VERIFY_TOKEN = process.env.MESSENGER_VERIFY_TOKEN;
