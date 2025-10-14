@@ -16,7 +16,7 @@ export async function initRedisOnce() {
     await redis.ping();
   } catch (err) {
     console.error("Redis connect error:", err?.message || err);
-    redis = null;
+    redis = null; // fall back to stateless
   }
   return redis;
 }

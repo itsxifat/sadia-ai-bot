@@ -7,11 +7,8 @@ import { generateReplyLLM } from "../../../lib/ai.js";
 const PAGE_TOKEN = process.env.MESSENGER_PAGE_TOKEN;
 const VERIFY_TOKEN = process.env.MESSENGER_VERIFY_TOKEN;
 
-function log(...a){ console.log("[WEBHOOK]", ...a); }
-
-function isEcho(evt) {
-  return Boolean(evt.message?.is_echo);
-}
+function log(...a) { console.log("[WEBHOOK]", ...a); }
+function isEcho(evt) { return Boolean(evt.message?.is_echo); }
 
 async function fbSend(body) {
   const url = `https://graph.facebook.com/v19.0/me/messages?access_token=${PAGE_TOKEN}`;
@@ -24,10 +21,8 @@ async function fbSend(body) {
   const ok = res.ok;
   const txt = await res.text();
   if (!ok) console.error("[SendAPI error]", res.status, txt, "BODY:", JSON.stringify(body));
-  else log("[SendAPI ok]", txt);
   return ok;
 }
-
 async function sendTyping(psid, on = true) {
   return fbSend({ recipient: { id: psid }, sender_action: on ? "typing_on" : "typing_off" });
 }
@@ -40,7 +35,7 @@ async function humanPause(text) {
   await new Promise(r => setTimeout(r, ms));
 }
 
-// VERIFY
+// VERIFY (GET)
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
   const mode = searchParams.get("hub.mode");
@@ -51,17 +46,15 @@ export async function GET(req) {
   return new Response("Forbidden", { status: 403 });
 }
 
-// RECEIVE
+// RECEIVE (POST)
 export async function POST(req) {
   try {
     const body = await req.json();
-    log("POST body.object", body.object);
-
     if (body.object !== "page") return new Response("Not a page object", { status: 404 });
 
     for (const entry of body.entry || []) {
       for (const evt of entry.messaging || []) {
-        if (isEcho(evt)) { log("skip echo"); continue; }
+        if (isEcho(evt)) continue;
 
         const psid = evt.sender?.id;
         const textIn = evt.message?.text?.trim();
@@ -71,7 +64,6 @@ export async function POST(req) {
 
         await sendTyping(psid, true);
         const reply = await generateReplyLLM({ psid, userText: textIn });
-        log("reply", reply);
         await humanPause(reply);
         await sendText(psid, reply);
         await sendTyping(psid, false);
