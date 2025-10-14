@@ -4,16 +4,18 @@ import Redis from "ioredis";
 let redis = null;
 
 export async function initRedisOnce() {
-  if (redis || !process.env.REDIS_URL) return null;
+  if (redis || !process.env.REDIS_URL) return redis;
   try {
     redis = new Redis(process.env.REDIS_URL, {
-      tls: process.env.REDIS_URL.startsWith("rediss://") ? {} : undefined,
-      password: process.env.REDIS_TOKEN || undefined,
+      connectTimeout: 10000,
       maxRetriesPerRequest: 2,
+      enableReadyCheck: true,
       lazyConnect: true,
     });
-    await redis.connect().catch(() => {});
-  } catch (_) {
+    await redis.connect();
+    await redis.ping();
+  } catch (err) {
+    console.error("Redis connect error:", err?.message || err);
     redis = null;
   }
   return redis;
