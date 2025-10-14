@@ -1,7 +1,14 @@
 // lib/ai.js
+// Sadia's brain: Gemini (free-tier friendly) + PG-13 Banglish persona
+// - Model fallbacks (fixes v1beta/404 issues)
+// - Optional Redis memory (name + tiny rolling summary)
+// - Tiny local tools (time, math, flip)
+// - Safety guards: Banglish-only, emoji limit, PG-13 filter, toxicity soft-guard
+
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { initRedisOnce, getRedis } from "./redis.js";
 
+// Initialize Redis once (safe if REDIS_URL missing)
 await initRedisOnce();
 const redis = getRedis();
 
@@ -18,6 +25,7 @@ If user pushes for explicit/unsafe/illegal things, politely refuse in Banglish a
 No sales/support menus. Just fun, caring conversation like a real friend.
 Keep replies concise unless the user asks for more detail.
 `;
+
 const TONE_HINT =
   FLIRT === "high"
     ? "Vibe hint: playful & flirty but wholesome (PG-13); keep it respectful and fun."
@@ -79,6 +87,7 @@ async function callTool(tool, args) {
     default: return null;
   }
 }
+
 const TOOL_SIGNATURE = `
 You may optionally request a tool by replying exactly:
 TOOL:time_now
@@ -87,23 +96,20 @@ TOOL:flip
 Use a tool only if the user explicitly asks about time, math, or a coin flip.
 `;
 
-// ---------- Model fallback (fixes 404) ----------
+// ---------- Model fallbacks (free-tier friendly) ----------
 const CANDIDATE_MODELS = [
-  process.env.GEMINI_MODEL,           // e.g., gemini-1.5-flash-latest
+  process.env.GEMINI_MODEL,          // e.g., gemini-1.5-flash-latest
   "gemini-1.5-flash-latest",
   "gemini-1.5-flash-8b",
   "gemini-1.5-flash",
 ];
 
-async function getModelHandle() {
+async function getModelHandle(systemInstruction) {
   let lastErr = null;
   for (const name of CANDIDATE_MODELS.filter(Boolean)) {
     try {
-      const handle = genAI.getGenerativeModel({
-        model: name,
-        systemInstruction: SYSTEM + "\n" + TONE_HINT + "\n" + TOOL_SIGNATURE,
-      });
-      // probe availability cheaply
+      const handle = genAI.getGenerativeModel({ model: name, systemInstruction });
+      // cheap probe to ensure this model works with your key/region
       await handle.generateContent({
         contents: [{ role: "user", parts: [{ text: "ping" }] }],
         generationConfig: { maxOutputTokens: 1 },
@@ -111,9 +117,10 @@ async function getModelHandle() {
       return handle;
     } catch (e) {
       lastErr = e;
+      // try the next candidate
     }
   }
-  throw lastErr || new Error("No Gemini model available for this key.");
+  throw lastErr || new Error("No Gemini model available for this key/region.");
 }
 
 // ---------- Memory (name + rolling summary) ----------
@@ -141,7 +148,8 @@ export async function generateReplyLLM({ psid, userText }) {
   const mem = await loadMem(psid);
   const nameLine = mem.name ? `User name: ${mem.name}` : "";
 
-  const model = await getModelHandle();
+  const systemInstruction = SYSTEM + "\n" + TONE_HINT + "\n" + TOOL_SIGNATURE;
+  const model = await getModelHandle(systemInstruction);
 
   const messages = [
     { role: "system", content: mem.summary ? `Brief context:\n${mem.summary}` : "Brief context: (new chat)" },
@@ -150,14 +158,24 @@ export async function generateReplyLLM({ psid, userText }) {
     { role: "user", content: (userText || "").slice(0, 1000) },
   ];
 
-  const resp = await model.generateContent({
-    contents: messages.map(m => ({ role: m.role, parts: [{ text: m.content }] })),
-    generationConfig: { temperature: 0.78, maxOutputTokens: 220 },
-  });
+  // Generate with rate-limit safety for free tier
+  let resp;
+  try {
+    resp = await model.generateContent({
+      contents: messages.map(m => ({ role: m.role, parts: [{ text: m.content }] })),
+      generationConfig: { temperature: 0.78, maxOutputTokens: 220 },
+    });
+  } catch (err) {
+    const msg = String(err?.message || "");
+    if (msg.includes("429") || msg.toLowerCase().includes("rate")) {
+      return "Free limit ta ektu cross hoye geche mone hocche. Ektu pore abar try kori? 🙂";
+    }
+    throw err;
+  }
 
   let out = (resp.response?.text?.() || "").trim();
 
-  // Tool dispatcher
+  // Tool dispatcher (only if model asked for it)
   if (out.startsWith("TOOL:")) {
     if (out.startsWith("TOOL:time_now")) {
       out = await callTool("time_now");
@@ -173,10 +191,11 @@ export async function generateReplyLLM({ psid, userText }) {
   if (!out) out = "Bujhlam na—aro ektu clear kore bolben? 🙂";
   out = pg13Guard(softToxicityGuard(enforceBanglish(limitEmoji(out)))).slice(0, 700);
 
-  // Capture name from user text
+  // Capture name from user text (Banglish)
   const m = (userText || "").match(/\b(amar\s+naam|amar\s+nam|my\s+name)\b.*?\b([A-Za-z\u0980-\u09FF]{2,})/i);
   if (m?.[2] && !mem.name) mem.name = m[2];
 
+  // Update memory summary
   const newSummary = updateSummary(mem.summary, userText, out);
   await saveMem(psid, { name: mem.name, summary: newSummary });
 
