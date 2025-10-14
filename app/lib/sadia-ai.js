@@ -1,9 +1,9 @@
 // lib/sadia-ai.js
 // Sadia — Banglish PG-13 friend on Gemini REST v1 with dynamic model discovery.
-// - NO v1beta usage.
-// - Discovers a supported model via /v1/models, caches it in memory.
-// - Robust 404/rate-limit handling; quiet fallback to avoid spam.
-// - Tiny local tools + safety guards.
+// Corrections applied:
+//  - systemInstruction has NO 'role' property (only parts[]).
+//  - contents has NO 'system' message; we keep few-shots + user.
+//  - probeModel simplified to return res.ok.
 
 const API_KEY = process.env.GEMINI_API_KEY;
 if (!API_KEY) console.warn("[AI] Missing GEMINI_API_KEY");
@@ -19,7 +19,8 @@ Boundaries: no explicit sexual content, no NSFW, no body details, no sexting.
 If user pushes for explicit/unsafe/illegal things, politely refuse in Banglish and steer back.
 No sales/support menus. Just fun, caring conversation like a real friend.
 Keep replies concise unless the user asks for more detail.
-`;
+`.trim();
+
 const TONE_HINT =
   FLIRT === "high"
     ? "Vibe hint: playful & flirty but wholesome (PG-13); keep it respectful and fun."
@@ -60,13 +61,14 @@ async function callTool(tool,args){
     default: return null;
   }
 }
+
 const TOOL_SIGNATURE = `
 You may optionally request a tool by replying exactly:
 TOOL:time_now
 TOOL:math: <expr>
 TOOL:flip
 Use a tool only if the user explicitly asks about time, math, or a coin flip.
-`;
+`.trim();
 
 // ---------------- REST helpers ----------------
 async function listModels(){
@@ -78,15 +80,11 @@ async function listModels(){
 }
 
 function supportsChat(m){
-  // Prefer models with 'generateContent' method, typically gemini-1.5-*
+  // Prefer Gemini 1.5 family for chat
   const name = m?.name || ""; // e.g. "models/gemini-1.5-flash-latest"
   return /models\/gemini-1\.5-/.test(name);
 }
-
-function modelNameFromFull(full){
-  // "models/gemini-1.5-flash-latest" -> "gemini-1.5-flash-latest"
-  return (full||"").replace(/^models\//,"");
-}
+function modelNameFromFull(full){ return (full||"").replace(/^models\//,""); }
 
 // cache chosen model in-memory
 let CHOSEN_MODEL = null;
@@ -95,14 +93,13 @@ async function chooseModel(){
   if (CHOSEN_MODEL) return CHOSEN_MODEL;
 
   const preferred = [
-    process.env.GEMINI_MODEL,                 // your env preference
+    process.env.GEMINI_MODEL,                 // env preference, e.g. gemini-1.5-flash-latest
     "gemini-1.5-flash-latest",
     "gemini-1.5-flash-8b",
     "gemini-1.5-flash",
-    "gemini-1.5-pro-latest" // as a last resort if flash variants not present
+    "gemini-1.5-pro-latest"
   ].filter(Boolean);
 
-  // try preferred list directly first via cheap probe
   for (const name of preferred){
     if (await probeModel(name)) {
       CHOSEN_MODEL = name;
@@ -111,7 +108,6 @@ async function chooseModel(){
     }
   }
 
-  // otherwise list models and pick the first supported
   const models = await listModels();
   const candidates = models.filter(supportsChat).map(m => modelNameFromFull(m.name));
   for (const name of candidates){
@@ -121,30 +117,30 @@ async function chooseModel(){
       return CHOSEN_MODEL;
     }
   }
-
   throw new Error("No supported Gemini model found for this key.");
 }
 
+// CORRECTED: probeModel with no 'role' in systemInstruction
 async function probeModel(model){
   try{
     const url = `https://generativelanguage.googleapis.com/v1/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(API_KEY)}`;
     const body = {
       contents: [{ role:"user", parts:[{ text:"ping" }]}],
       generationConfig: { maxOutputTokens: 1 },
-      systemInstruction: { role:"system", parts:[{ text:"probe" }]},
+      systemInstruction: { parts:[{ text:"probe" }]},
     };
     const res = await fetch(url,{ method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body) });
-    if (!res.ok) return false;
-    return true;
+    return res.ok;
   }catch{ return false; }
 }
 
+// CORRECTED: systemInstruction has no role; contents has no 'system' message
 async function restGenerate(model, messages){
   const contents = messages.map(m => ({ role: m.role, parts: [{ text: m.content }]}));
   const body = {
     contents,
     generationConfig: { temperature: 0.78, maxOutputTokens: 220 },
-    systemInstruction: { role: "system", parts: [{ text: SYSTEM + "\n" + TONE_HINT + "\n" + TOOL_SIGNATURE }] },
+    systemInstruction: { parts: [{ text: `${SYSTEM}\n${TONE_HINT}\n${TOOL_SIGNATURE}` }] },
   };
   const url = `https://generativelanguage.googleapis.com/v1/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(API_KEY)}`;
   const res = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body) });
@@ -165,15 +161,15 @@ export async function generateReplyLLM({ psid, userText }){
     return null; // webhook will cooldown & avoid spam
   }
 
+  // CORRECTED: no 'system' message here (few-shots + user only)
   const messages = [
-    { role:"system", content:"Brief context: (stateless free-tier mode)" },
     ...FEWSHOTS,
     { role:"user", content:String(userText||"").slice(0,1000) },
   ];
 
   let model;
   try {
-    model = await chooseModel(); // resolves and caches a working model name
+    model = await chooseModel();
   } catch (err) {
     console.error("[AI] Model discovery failed:", err?.message || err);
     return null;
@@ -184,7 +180,6 @@ export async function generateReplyLLM({ psid, userText }){
     raw = await restGenerate(model, messages);
   } catch (err) {
     const msg = String(err?.message || "");
-    // stay quiet on rate limit/unavailable; webhook has cooldown
     if (msg.includes("429") || /quota|rate/i.test(msg)) {
       console.warn("[AI] Rate/Quota hit, staying quiet once.");
       return null;
