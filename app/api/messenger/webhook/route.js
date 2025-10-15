@@ -6,8 +6,6 @@ import { generateReplyLLM } from "../../../lib/sadia-ai.js";
 import { usersCol } from "../../../lib/mongo.js";
 import { touchAndGateUser } from "../../../lib/user-gate.js";
 import { signPayload } from "../../../lib/sign.js";
-import { ytFetchAndUpload } from "../../../lib/yt.js";
-import { YT_QUEUE } from "../../../lib/task-queue.js";
 
 const PAGE_TOKEN   = process.env.MESSENGER_PAGE_TOKEN || "";
 const VERIFY_TOKEN = process.env.MESSENGER_VERIFY_TOKEN || "";
@@ -27,7 +25,12 @@ function isEcho(evt) { return Boolean(evt.message?.is_echo); }
 async function fbSend(body) {
   if (!PAGE_TOKEN) { console.error("[SendAPI] Missing MESSENGER_PAGE_TOKEN"); return false; }
   const url = `https://graph.facebook.com/v24.0/me/messages?access_token=${encodeURIComponent(PAGE_TOKEN)}`;
-  const res = await fetch(url, { method: "POST", headers: { "Content-Type":"application/json" }, body: JSON.stringify(body), cache: "no-store" });
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type":"application/json" },
+    body: JSON.stringify(body),
+    cache: "no-store"
+  });
   if (!res.ok) {
     const txt = await res.text().catch(()=> "");
     console.error("[SendAPI error]", res.status, txt, "BODY:", JSON.stringify(body));
@@ -38,19 +41,13 @@ async function sendSenderAction(psid, action) { return fbSend({ recipient: { id:
 async function markSeen(psid){ return sendSenderAction(psid, "mark_seen"); }
 async function sendTyping(psid, on=true){ return sendSenderAction(psid, on ? "typing_on" : "typing_off"); }
 async function sendText(psid, text){ return fbSend({ recipient:{ id: psid }, message:{ text: String(text||"").slice(0,1200) } }); }
-async function sendAudio(psid, url) {
-  return fbSend({
-    recipient: { id: psid },
-    message: { attachment: { type: "audio", payload: { url, is_reusable: true } } }
-  });
-}
 
 // keep-typing loop (refreshed every ~7s)
 async function typingLoop(psid, stopSignal) {
   try {
     while (!stopSignal.stopped) {
       await sendTyping(psid, true);
-      await new Promise(r => setTimeout(r, 7000)); // refresh typing
+      await new Promise(r => setTimeout(r, 7000));
     }
   } catch {}
 }
@@ -218,7 +215,7 @@ export async function POST(req) {
           continue;
         }
 
-        // ----- -yt <YouTube URL> : QUEUED with progress typing -----
+        // ----- -yt <YouTube URL> : delegate to BACKGROUND worker -----
         if (/^-yt\s+(\S+)/i.test(textIn)) {
           const m = textIn.match(/^-yt\s+(\S+)/i);
           const you = m?.[1]?.trim();
@@ -233,65 +230,17 @@ export async function POST(req) {
           }
           if (gate.reason === "daily_limit") { await sendText(psid, "Daily 100 limit reached; try again tomorrow."); continue; }
 
-          // Queue job
-          const placeInQueue = YT_QUEUE.size() + 1;
-          await sendText(psid, `🎵 Request received. ${placeInQueue > 1 ? `You are #${placeInQueue} in queue.` : "Starting soon…"}`);
+          await sendText(psid, "🎵 Request received. Starting soon…");
 
-          // Typing loop while waiting/working
-          const stopSignal = { stopped: false };
-          typingLoop(psid, stopSignal).catch(()=>{});
-
-          YT_QUEUE.enqueue({
-            key: `yt:${psid}:${Date.now()}`,
-            psid,
-            run: async () => {
-              const stageText = (stage, payload) => {
-                switch (stage) {
-                  case "info":
-                    return `🎧 ${payload.title} (${Math.floor(payload.lengthSec/60)}:${String(payload.lengthSec%60).padStart(2,"0")})`;
-                  case "download_start":
-                    return "⬇️ Downloading audio…";
-                  case "download_progress":
-                    return `⬇️ Downloading… ${payload.mb} MB`;
-                  case "download_done":
-                    return "✅ Downloaded. Preparing upload…";
-                  case "upload_start":
-                    return "⬆️ Uploading…";
-                  case "upload_done":
-                    return "✅ Uploaded. Sending to you…";
-                }
-                return null;
-              };
-
-              let lastSent = 0;
-              const onStage = async (s, p) => {
-                const now = Date.now();
-                const msg = stageText(s, p);
-                if (msg && now - lastSent > 2200) {
-                  lastSent = now;
-                  await sendText(psid, msg);
-                }
-              };
-
-              try {
-                await onStage("info", { title: "Loading metadata…", lengthSec: 0 });
-                const { url, title, lengthSec } = await ytFetchAndUpload(you, onStage);
-                await sendAudio(psid, url);
-                await sendText(psid, `🎶 Sent: ${title} (${Math.floor(lengthSec/60)}:${String(lengthSec%60).padStart(2,"0")}) — enjoy!`);
-              } catch (e) {
-                const code = String(e.message || e);
-                let msg = "Couldn’t fetch that video.";
-                if (code === "invalid_youtube_url") msg = "Invalid YouTube link. Please send the full URL.";
-                else if (code === "too_long") msg = "Sorry, max audio length is 8 minutes.";
-                else if (code === "file_too_large") msg = "Audio too large to send.";
-                else if (code === "no_audio_format") msg = "No compatible audio stream found.";
-                await sendText(psid, msg);
-              } finally {
-                stopSignal.stopped = true;
-                await sendTyping(psid, false);
-              }
-            }
-          });
+          // Fire-and-forget background job (Vercel background functions)
+          fetch(`${BASE_URL}/api/yt/run`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-vercel-background": "1"
+            },
+            body: JSON.stringify({ psid, url: you }),
+          }).catch(()=>{});
 
           continue;
         }
@@ -390,7 +339,7 @@ export async function POST(req) {
         // Gate + counters
         const gate = await touchAndGateUser(psid);
 
-        // Unverified → show onboarding (throttled)
+        // Unverified → onboarding (throttled)
         if (!gate.user?.verified) {
           await maybeShowOnboarding(psid);
         }
@@ -417,7 +366,7 @@ export async function POST(req) {
           continue;
         }
 
-        // Normal LLM flow (within free window or verified/vip)
+        // Normal LLM flow
         let reply = await generateReplyLLM({ psid, userText: textIn });
         if (reply == null) {
           const soft = "Ekto tech jhamela hocche. Abar chesta kortesi 🙂";
