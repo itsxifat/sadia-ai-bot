@@ -1,3 +1,6 @@
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
 import { usersCol } from "../../../lib/mongo.js";
 
 export async function GET(req) {
