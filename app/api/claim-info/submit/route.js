@@ -2,8 +2,8 @@
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-import { usersCol } from "../../../../lib/mongo.js";
-import { verifySignature } from "../../../../lib/sign.js";
+import { usersCol } from "../../../lib/mongo.js";
+import { verifySignature } from "../../../lib/sign.js";
 
 export async function POST(req) {
   try{

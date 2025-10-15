@@ -1,6 +1,6 @@
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-import { usersCol } from "../../../../lib/mongo.js";
+import { usersCol } from "../../../lib/mongo.js";
 const PAGE_TOKEN = process.env.MESSENGER_PAGE_TOKEN || "";
 
 export async function POST(req) {
