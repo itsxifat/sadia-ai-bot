@@ -1,45 +1,59 @@
 // lib/yt.js
-// Robust YouTube → audio uploader for Messenger
-// Requires: npm i ytdl-core ytpl
+// Robust YouTube → audio uploader for Messenger, no 'ytpl' dependency.
+// npm i ytdl-core
 // Also set: BLOB_READ_WRITE_TOKEN (Vercel Blob R/W token)
 
 const MAX_SECONDS = 12 * 60;            // 12 minutes
-const MAX_BYTES   = 24 * 1024 * 1024;   // ~24 MB for safety
+const MAX_BYTES   = 24 * 1024 * 1024;   // ~24 MB
 
 function normalizeWatchUrlFromId(videoId) {
   return `https://www.youtube.com/watch?v=${videoId}`;
 }
 
 function pickFirst(paramMap, ...names) {
-  for (const n of names) {
-    if (paramMap.get(n)) return paramMap.get(n);
-  }
+  for (const n of names) if (paramMap.get(n)) return paramMap.get(n);
   return null;
+}
+
+// Try to pull first videoId from playlist HTML without external libs
+async function resolveFirstVideoFromPlaylist(listId) {
+  const url = `https://www.youtube.com/playlist?list=${encodeURIComponent(listId)}&hl=en`;
+  const res = await fetch(url, { headers: { "Accept-Language": "en" } });
+  if (!res.ok) throw Object.assign(new Error("playlist_fetch_failed"), { code: "playlist_fetch_failed" });
+
+  const html = await res.text();
+
+  // quick regex: find the first "playlistVideoRenderer":{"videoId":"XXXXXXXXXXX"
+  const m = html.match(/"playlistVideoRenderer"\s*:\s*\{[^}]*"videoId"\s*:\s*"([a-zA-Z0-9_-]{11})"/);
+  if (m && m[1]) return m[1];
+
+  // fallback: search generic "videoId":"XXXXXXXXXXX" near the start
+  const m2 = html.match(/"videoId"\s*:\s*"([a-zA-Z0-9_-]{11})"/);
+  if (m2 && m2[1]) return m2[1];
+
+  throw Object.assign(new Error("playlist_first_failed"), { code: "playlist_first_failed" });
 }
 
 /**
  * normalizeYouTubeUrlAny(input)
- *  - Accepts: shorts, youtu.be, watch URLs, “si” params, timestamps, etc.
- *  - If a playlist-only URL is provided, resolves to the **first video** in the playlist.
- *  - Returns a normal watch URL.
- *  - Throws coded errors on invalid URLs or unresolvable playlists.
+ *  - Accepts: shorts, youtu.be, watch URLs, timestamps, 'si' params, etc.
+ *  - If playlist-only link is given, resolves to the FIRST video in the playlist.
+ *  - Returns a normalized watch URL.
  */
 export async function normalizeYouTubeUrlAny(input) {
-  const ytpl = (await import("ytpl")).default;
-
   let u;
-  try {
-    u = new URL(input);
-  } catch {
+  try { u = new URL(input); }
+  catch {
     const err = new Error("invalid_youtube_url");
     err.code = "invalid_youtube_url";
     throw err;
   }
+
   const host = u.hostname.toLowerCase();
 
-  // handle youtu.be/<id>
+  // youtu.be/<id>
   if (host === "youtu.be") {
-    const id = u.pathname.replace(/^\/+/, ""); // after slash
+    const id = u.pathname.replace(/^\/+/, "");
     if (id) return normalizeWatchUrlFromId(id);
   }
 
@@ -49,32 +63,21 @@ export async function normalizeYouTubeUrlAny(input) {
     if (id) return normalizeWatchUrlFromId(id);
   }
 
-  // standard watch link: pick v= if present
+  // standard watch/link
   if (host.includes("youtube.com")) {
     const v = pickFirst(u.searchParams, "v");
     if (v) return normalizeWatchUrlFromId(v);
 
-    // playlist only? → resolve first item using ytpl
+    // playlist-only? grab first item
     const listId = pickFirst(u.searchParams, "list", "playlist", "p");
     if (listId) {
-      try {
-        // ytpl returns items in order; pageSize=1 gets just the first
-        const pl = await ytpl(listId, { pages: 1 });
-        const first = pl?.items?.[0]?.id;
-        if (first) return normalizeWatchUrlFromId(first);
-      } catch (e) {
-        // fall through to coded error
-      }
-      const err = new Error("playlist_first_failed");
-      err.code = "playlist_first_failed";
-      throw err;
+      const firstId = await resolveFirstVideoFromPlaylist(listId);
+      return normalizeWatchUrlFromId(firstId);
     }
   }
 
-  // if we get here and still no watch form, try returning raw if it’s a plausible yt URL
-  if (/youtube\.com|youtu\.be/i.test(u.hostname)) {
-    return u.toString();
-  }
+  // fallback if it still looks like a yt URL
+  if (/youtube\.com|youtu\.be/i.test(host)) return u.toString();
 
   const err = new Error("invalid_youtube_url");
   err.code = "invalid_youtube_url";
@@ -107,8 +110,9 @@ async function uploadToVercelBlob(buf, filenameExt = "webm") {
 /**
  * ytFetchAndUpload(url, onStage?)
  *  - url: any YouTube URL (video | shorts | youtu.be | playlist)
- *  - onStage: (stage, payload) => void
- *     stages: info, download_start, download_progress, download_done, upload_start, upload_done
+ *  - onStage(stage, payload)
+ *     stages: info, download_start, download_progress, download_done,
+ *             upload_start, upload_done
  *  returns: { url, title, lengthSec }
  */
 export async function ytFetchAndUpload(inputUrl, onStage) {
@@ -123,7 +127,7 @@ export async function ytFetchAndUpload(inputUrl, onStage) {
     throw err;
   }
 
-  // Fetch info
+  // Get info
   let info;
   try {
     info = await ytdl.getInfo(url);
@@ -150,7 +154,7 @@ export async function ytFetchAndUpload(inputUrl, onStage) {
     throw err;
   }
 
-  // Prefer audio-only formats
+  // Pick audio-only format
   const format = (await import("ytdl-core")).chooseFormat(info.formats, {
     quality: "highestaudio",
     filter: "audioonly"
@@ -163,7 +167,7 @@ export async function ytFetchAndUpload(inputUrl, onStage) {
 
   onStage?.("info", { title, lengthSec });
 
-  // Download → buffer (guard with MAX_BYTES)
+  // Download with in-memory guard
   onStage?.("download_start");
   const stream = (await import("ytdl-core")).default(url, {
     quality: "highestaudio",
@@ -185,7 +189,6 @@ export async function ytFetchAndUpload(inputUrl, onStage) {
         return;
       }
       chunks.push(c);
-      // progress ping roughly each MB
       if (received % (1024 * 1024) < c.length) {
         const mb = Math.round(received / (1024 * 1024));
         onStage?.("download_progress", { mb });
