@@ -6,12 +6,14 @@ import { generateReplyLLM } from "../../../lib/sadia-ai.js";
 import { usersCol } from "../../../lib/mongo.js";
 import { touchAndGateUser } from "../../../lib/user-gate.js";
 import { signPayload } from "../../../lib/sign.js";
+import { ytFetchAndUpload } from "../../../lib/yt.js";
+import { YT_QUEUE } from "../../../lib/task-queue.js";
 
 const PAGE_TOKEN   = process.env.MESSENGER_PAGE_TOKEN || "";
 const VERIFY_TOKEN = process.env.MESSENGER_VERIFY_TOKEN || "";
 const BASE_URL     = (process.env.PUBLIC_BASE_URL || "https://example.com").replace(/\/+$/,"");
 
-// Bootstrap root-admins (cannot be banned/demoted)
+// Root-admin PSIDs (cannot be banned/demoted)
 const ADMIN_SET = new Set(
   (process.env.ADMIN_PSIDS || "")
     .split(",")
@@ -36,7 +38,24 @@ async function sendSenderAction(psid, action) { return fbSend({ recipient: { id:
 async function markSeen(psid){ return sendSenderAction(psid, "mark_seen"); }
 async function sendTyping(psid, on=true){ return sendSenderAction(psid, on ? "typing_on" : "typing_off"); }
 async function sendText(psid, text){ return fbSend({ recipient:{ id: psid }, message:{ text: String(text||"").slice(0,1200) } }); }
+async function sendAudio(psid, url) {
+  return fbSend({
+    recipient: { id: psid },
+    message: { attachment: { type: "audio", payload: { url, is_reusable: true } } }
+  });
+}
 
+// keep-typing loop (refreshed every ~7s)
+async function typingLoop(psid, stopSignal) {
+  try {
+    while (!stopSignal.stopped) {
+      await sendTyping(psid, true);
+      await new Promise(r => setTimeout(r, 7000)); // refresh typing
+    }
+  } catch {}
+}
+
+// Follow card + web form link
 function followCard(psid) {
   const token = signPayload({ psid });
   const text = "Follow our Page to unlock full chat with Sadia 💚\n\nType: -followed  or  -notfollowed\nOr share your name & profile link:";
@@ -65,8 +84,7 @@ function followCard(psid) {
   });
 }
 
-// NEW: a plain text onboarding (for FB Lite & as instruction)
-// throttled by onboardAt (<= once per 6h)
+// Show onboarding (text + buttons + link) at most once per 6h for unverified users
 async function maybeShowOnboarding(psid) {
   const col = await usersCol();
   const u = await col.findOne({ psid }, { projection: { _id:0, verified:1, onboardAt:1 } }) || {};
@@ -78,7 +96,6 @@ async function maybeShowOnboarding(psid) {
 
   const token = signPayload({ psid });
   const link  = `${BASE_URL}/claim-info?t=${encodeURIComponent(token)}`;
-
   const txt = [
     "👋 To unlock full chat with Sadia:",
     "• Tap: I’ve Followed ✅ or Not Yet (buttons below)",
@@ -89,7 +106,6 @@ async function maybeShowOnboarding(psid) {
     `Or fill this form: ${link}`,
   ].join("\n");
 
-  // Send both (text + card). Lite users will at least see the text.
   await sendText(psid, txt);
   await followCard(psid);
 
@@ -123,7 +139,7 @@ async function isAdmin(psid) {
   return !!u?.isAdmin;
 }
 
-/* ===== Verify webhook (GET) ===== */
+/* ===== Verification (GET) ===== */
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
   const mode = searchParams.get("hub.mode");
@@ -146,7 +162,7 @@ export async function POST(req) {
         const psid = evt.sender?.id;
         if (!psid) continue;
 
-        // Handle postbacks
+        // Postbacks
         if (evt.postback?.payload) {
           const payload = evt.postback.payload;
           const col = await usersCol();
@@ -163,14 +179,16 @@ export async function POST(req) {
         }
 
         if (isEcho(evt)) continue;
+
         const mid = evt.message?.mid;
         const textIn = evt.message?.text?.trim();
         if (!mid || !textIn) { log("non-text or missing mid; ignoring", { psid, hasText: !!textIn, hasMid: !!mid }); continue; }
+
         const st = getState(psid);
         if (st.processedMids.has(mid)) { log("dup mid; skip", mid); continue; }
         rememberMid(psid, mid);
 
-        // -------- FB Lite friendly commands (user info) --------
+        // ===== FB Lite + Commands =====
         if (/^-followed\b/i.test(textIn)) {
           const col = await usersCol();
           await col.updateOne({ psid }, { $set: { followClaim: "claimed", followClaimAt: Date.now(), updatedAt: Date.now() } }, { upsert: true });
@@ -200,7 +218,85 @@ export async function POST(req) {
           continue;
         }
 
-        // ---------------- Admin commands ----------------
+        // ----- -yt <YouTube URL> : QUEUED with progress typing -----
+        if (/^-yt\s+(\S+)/i.test(textIn)) {
+          const m = textIn.match(/^-yt\s+(\S+)/i);
+          const you = m?.[1]?.trim();
+
+          // Gate (respect bans / follow / daily)
+          const gate = await touchAndGateUser(psid, { action: "yt" });
+          if (gate.reason === "banned") { await sendText(psid, "Access is restricted."); continue; }
+          if (gate.reason === "need_follow") {
+            await sendText(psid, "Follow required to use music feature 💚 Type -followed after following, or open the verification card.");
+            await followCard(psid);
+            continue;
+          }
+          if (gate.reason === "daily_limit") { await sendText(psid, "Daily 100 limit reached; try again tomorrow."); continue; }
+
+          // Queue job
+          const placeInQueue = YT_QUEUE.size() + 1;
+          await sendText(psid, `🎵 Request received. ${placeInQueue > 1 ? `You are #${placeInQueue} in queue.` : "Starting soon…"}`);
+
+          // Typing loop while waiting/working
+          const stopSignal = { stopped: false };
+          typingLoop(psid, stopSignal).catch(()=>{});
+
+          YT_QUEUE.enqueue({
+            key: `yt:${psid}:${Date.now()}`,
+            psid,
+            run: async () => {
+              const stageText = (stage, payload) => {
+                switch (stage) {
+                  case "info":
+                    return `🎧 ${payload.title} (${Math.floor(payload.lengthSec/60)}:${String(payload.lengthSec%60).padStart(2,"0")})`;
+                  case "download_start":
+                    return "⬇️ Downloading audio…";
+                  case "download_progress":
+                    return `⬇️ Downloading… ${payload.mb} MB`;
+                  case "download_done":
+                    return "✅ Downloaded. Preparing upload…";
+                  case "upload_start":
+                    return "⬆️ Uploading…";
+                  case "upload_done":
+                    return "✅ Uploaded. Sending to you…";
+                }
+                return null;
+              };
+
+              let lastSent = 0;
+              const onStage = async (s, p) => {
+                const now = Date.now();
+                const msg = stageText(s, p);
+                if (msg && now - lastSent > 2200) {
+                  lastSent = now;
+                  await sendText(psid, msg);
+                }
+              };
+
+              try {
+                await onStage("info", { title: "Loading metadata…", lengthSec: 0 });
+                const { url, title, lengthSec } = await ytFetchAndUpload(you, onStage);
+                await sendAudio(psid, url);
+                await sendText(psid, `🎶 Sent: ${title} (${Math.floor(lengthSec/60)}:${String(lengthSec%60).padStart(2,"0")}) — enjoy!`);
+              } catch (e) {
+                const code = String(e.message || e);
+                let msg = "Couldn’t fetch that video.";
+                if (code === "invalid_youtube_url") msg = "Invalid YouTube link. Please send the full URL.";
+                else if (code === "too_long") msg = "Sorry, max audio length is 8 minutes.";
+                else if (code === "file_too_large") msg = "Audio too large to send.";
+                else if (code === "no_audio_format") msg = "No compatible audio stream found.";
+                await sendText(psid, msg);
+              } finally {
+                stopSignal.stopped = true;
+                await sendTyping(psid, false);
+              }
+            }
+          });
+
+          continue;
+        }
+
+        // ----- Admin & help -----
         if (/^-help\b/i.test(textIn)) {
           const col = await usersCol();
           const u = (await col.findOne({ psid }, { projection: { _id:0 } })) || {};
@@ -212,12 +308,13 @@ export async function POST(req) {
             "• -followed / -notfollowed",
             "• -name <Your Name>",
             "• -profile <https://your.profile>",
+            "• -yt <YouTube URL>  → get audio as a voice message",
             `• Web form: ${link}`,
             ...(isAdm ? [
               "• -ban <psid?>      (admin)",
               "• -unban <psid?>    (admin)",
               "• -addadmin <psid>  (admin)",
-              "• -deladmin <psid>  (admin)"
+              "• -deladmin <psid>  (admin)",
             ] : []),
             "",
             "Your status:",
@@ -226,7 +323,7 @@ export async function POST(req) {
             `• banned: ${u.banned ? "yes" : "no"}`,
             `• admin: ${isAdm ? "yes" : "no"}`,
             `• free used: ${u.freeCount || 0} / 10`,
-            `• daily used: ${u.dailyCount || 0} / 100`
+            `• daily used: ${u.dailyCount || 0} / 100`,
           ];
           await sendText(psid, lines.join("\n"));
           continue;
@@ -236,7 +333,6 @@ export async function POST(req) {
         if (/^-(?:ban|unban)\b/i.test(textIn)) {
           const isAdm = await isAdmin(psid);
           if (!isAdm) { await sendText(psid, "This command is admin-only."); continue; }
-
           const banFlag = /^-ban\b/i.test(textIn);
           const m = textIn.match(/^(?:-ban|-unban)\s+(\d{5,})/i);
           const target = m ? m[1] : psid;
@@ -251,59 +347,50 @@ export async function POST(req) {
             if (targetIsAdmin) { await sendText(psid, "Admins cannot be banned."); continue; }
           }
 
-          await col.updateOne(
-            { psid: target },
-            { $set: { banned: banFlag, updatedAt: Date.now() } },
-            { upsert: true }
-          );
+          await col.updateOne({ psid: target }, { $set: { banned: banFlag, updatedAt: Date.now() } }, { upsert: true });
           await sendText(psid, `${banFlag ? "Banned" : "Unbanned"}: ${target}`);
           continue;
         }
 
-        // -addadmin <psid>
+        // -addadmin
         if (/^-addadmin\s+(\d{5,})/i.test(textIn)) {
           const isAdm = await isAdmin(psid);
           if (!isAdm) { await sendText(psid, "This command is admin-only."); continue; }
           const m = textIn.match(/^-addadmin\s+(\d{5,})/i);
           const target = m?.[1];
           if (!target) { await sendText(psid, "Usage: -addadmin <psid>"); continue; }
-
           const col = await usersCol();
           await col.updateOne({ psid: target }, { $set: { isAdmin: true, banned: false, updatedAt: Date.now() } }, { upsert: true });
           await sendText(psid, `Admin added: ${target}`);
           continue;
         }
 
-        // -deladmin <psid>
+        // -deladmin
         if (/^-deladmin\s+(\d{5,})/i.test(textIn)) {
           const isAdm = await isAdmin(psid);
           if (!isAdm) { await sendText(psid, "This command is admin-only."); continue; }
           const m = textIn.match(/^-deladmin\s+(\d{5,})/i);
           const target = m?.[1];
           if (!target) { await sendText(psid, "Usage: -deladmin <psid>"); continue; }
-
           if (ADMIN_SET.has(target)) { await sendText(psid, "Root admins cannot be demoted."); continue; }
-          if (target === psid && ADMIN_SET.size === 0) {
-            await sendText(psid, "You can’t demote yourself."); continue;
-          }
-
+          if (target === psid && ADMIN_SET.size === 0) { await sendText(psid, "You can’t demote yourself."); continue; }
           const col = await usersCol();
           await col.updateOne({ psid: target }, { $set: { isAdmin: false, updatedAt: Date.now() } }, { upsert: true });
           await sendText(psid, `Admin removed: ${target}`);
           continue;
         }
-        // ---------------- end admin commands ----------------
 
+        // ===== Cooldown =====
         const now = Date.now();
         if (st.cooldownUntil && now < st.cooldownUntil) { log("cooldown active; suppress reply"); continue; }
 
         await markSeen(psid);
         await sendTyping(psid, true);
 
-        // GATE (handles banned/limits and increments counters)
+        // Gate + counters
         const gate = await touchAndGateUser(psid);
 
-        // If the user is unverified (regardless of limit), show onboarding (once/6h) so they always see buttons & commands.
+        // Unverified → show onboarding (throttled)
         if (!gate.user?.verified) {
           await maybeShowOnboarding(psid);
         }
@@ -313,10 +400,9 @@ export async function POST(req) {
           if (gate.reason === "banned") {
             await sendText(psid, "Access is currently restricted.");
           } else if (gate.reason === "need_follow") {
-            // Limit reached without follow → show reminder + buttons + commands + link
             const token = signPayload({ psid });
             const link  = `${BASE_URL}/claim-info?t=${encodeURIComponent(token)}`;
-            const msg   = [
+            const msg = [
               "Follow required to continue chatting 💚",
               "Type: -followed  or  -notfollowed",
               "Share name: -name Your Name",
@@ -331,7 +417,7 @@ export async function POST(req) {
           continue;
         }
 
-        // Below: Allowed to call LLM (includes unverified users within 10-free window)
+        // Normal LLM flow (within free window or verified/vip)
         let reply = await generateReplyLLM({ psid, userText: textIn });
         if (reply == null) {
           const soft = "Ekto tech jhamela hocche. Abar chesta kortesi 🙂";
@@ -343,7 +429,9 @@ export async function POST(req) {
         }
 
         if (st.lastReply === reply && (now - st.lastReplyAt) < 30_000) {
-          log("suppress duplicate reply within 30s"); await sendTyping(psid, false); continue;
+          log("suppress duplicate reply within 30s");
+          await sendTyping(psid, false);
+          continue;
         }
 
         await humanPause(reply);
@@ -355,6 +443,7 @@ export async function POST(req) {
     return new Response("EVENT_RECEIVED", { status: 200 });
   } catch (e) {
     console.error("[WEBHOOK error]", e);
+    // 200 so FB doesn't retry endlessly (if we already processed entries)
     return new Response("OK", { status: 200 });
   }
 }
