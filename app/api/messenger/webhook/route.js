@@ -55,8 +55,10 @@ async function sendVerifiedInfo(psid){
   return sendText(psid, `You're verified now! 🎉 Daily ${DAILY_LIMIT_VERIFIED} chat unlocked (auto-reset each day).`);
 }
 
-// ── DB helpers
-const MEM_TTL = 60_000; const memCache = new Map();
+// ======= FRESH-STATE CACHE (fix for Unverify) =======
+const MEM_TTL = 3000; // 3s cache; make 0 to disable
+const memCache = new Map();
+
 function blank(psid){
   return {
     psid,
@@ -69,21 +71,41 @@ function blank(psid){
     dailyCount: 0, dailyAt: null, // YYYY-MM-DD Asia/Dhaka
     name: null, picture: null, locale: null,
     __profileError: false,
-    updatedAt: Date.now(),
+    updatedAt: 0,
   };
 }
 async function users(){ return usersCol(); }
-function todayDhaka(){
-  return new Intl.DateTimeFormat("en-CA", { timeZone:"Asia/Dhaka", year:"numeric", month:"2-digit", day:"2-digit" }).format(new Date());
-}
+function cacheSet(psid, state){ memCache.set(psid, { state, ts: Date.now() }); return state; }
+
+/**
+ * Get a state fresh enough for auth/limits.
+ * - If cache expired, load from DB.
+ * - Otherwise compare DB.updatedAt with cache.updatedAt (cheap projection). If DB newer → reload.
+ */
 async function getState(psid){
-  const c = memCache.get(psid);
-  if (c && (Date.now()-c.ts)<MEM_TTL) return c.state;
-  const col = await users();
-  const doc = await col.findOne({ psid });
-  const st = doc ? doc : blank(psid);
-  memCache.set(psid, { state: st, ts: Date.now() });
-  return st;
+  const cached = memCache.get(psid);
+  const now = Date.now();
+
+  if (!cached || (MEM_TTL > 0 && (now - cached.ts) > MEM_TTL)) {
+    const col = await users();
+    const doc = await col.findOne({ psid }) || blank(psid);
+    return cacheSet(psid, doc);
+  }
+
+  try{
+    const col = await users();
+    const fresh = await col.findOne({ psid }, { projection: { updatedAt: 1 } });
+    const dbUpdated = fresh?.updatedAt || 0;
+    const cacheUpdated = cached.state?.updatedAt || 0;
+
+    if (dbUpdated > cacheUpdated) {
+      const full = await col.findOne({ psid }) || blank(psid);
+      return cacheSet(psid, full);
+    }
+    return cached.state;
+  }catch{
+    return cached.state;
+  }
 }
 function rememberMidLocal(st, mid){
   const arr = Array.isArray(st.processedMids) ? st.processedMids : [];
@@ -92,11 +114,17 @@ function rememberMidLocal(st, mid){
 async function saveState(psid, patch){
   const col = await users();
   const base = await getState(psid);
-  const next = { ...base, ...patch, processedMids:(patch?.processedMids ?? base.processedMids ?? []).slice(-50), updatedAt: Date.now() };
+  const next = {
+    ...base,
+    ...patch,
+    processedMids: (patch?.processedMids ?? base.processedMids ?? []).slice(-50),
+    updatedAt: Date.now(),
+  };
   await col.updateOne({ psid }, { $set: next }, { upsert: true });
-  memCache.set(psid, { state: next, ts: Date.now() });
+  cacheSet(psid, next);
   return next;
 }
+// ======= /FRESH-STATE CACHE =======
 
 // ── Messenger Profile (robust)
 async function fetchMessengerProfile(psid){
@@ -140,6 +168,7 @@ export async function POST(req){
 
     for (const entry of body.entry || []){
       for (const evt of entry.messaging || []){
+
         // Postbacks
         if (evt.postback?.payload && evt.sender?.id){
           const psid = evt.sender.id;
@@ -167,8 +196,10 @@ export async function POST(req){
         if (!mid || !textIn) continue;
 
         let st = await getState(psid);
-        if (Array.isArray(st.processedMids) && st.processedMids.includes(mid)) continue;
+        // belt & suspenders: if we *think* they're verified, re-get immediately (compares updatedAt)
+        if (st.verified) st = await getState(psid);
 
+        if (Array.isArray(st.processedMids) && st.processedMids.includes(mid)) continue;
         const now = Date.now();
         if (st.cooldownUntil && now < st.cooldownUntil) continue;
 
@@ -199,19 +230,19 @@ export async function POST(req){
           continue;
         }
 
-        // Not verified & over free limit → every message enforce state
+        // Not verified & over free limit → enforce every message
         if (!st.verified && st.freeCount >= FREE_LIMIT){
           if (st.followClaim === "claimed") {
-            await sendPendingReview(psid);    // pending every message
-          } else { // "not_yet" or "unknown"
-            await sendFollowPrompt(psid);     // follow prompt every message
+            await sendPendingReview(psid);
+          } else {
+            await sendFollowPrompt(psid);
           }
           continue;
         }
 
         // Verified: enforce daily 100 (Dhaka)
         if (st.verified){
-          const today = todayDhaka();
+          const today = new Intl.DateTimeFormat("en-CA", { timeZone:"Asia/Dhaka", year:"numeric", month:"2-digit", day:"2-digit" }).format(new Date());
           let dailyCount = st.dailyCount || 0;
           let dailyAt    = st.dailyAt || today;
           if (dailyAt !== today){ dailyAt = today; dailyCount = 0; }

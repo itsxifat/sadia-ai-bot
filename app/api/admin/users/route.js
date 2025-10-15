@@ -4,10 +4,15 @@ export const dynamic = "force-dynamic";
 import { usersCol } from "../../../lib/mongo.js";
 
 const PAGE_TOKEN = process.env.MESSENGER_PAGE_TOKEN || "";
+
 async function fbSend(body){
   if (!PAGE_TOKEN) return false;
   const url = `https://graph.facebook.com/v19.0/me/messages?access_token=${encodeURIComponent(PAGE_TOKEN)}`;
-  const res = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body) });
+  const res = await fetch(url, {
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify(body)
+  });
   return res.ok;
 }
 async function sendText(psid, text){
@@ -23,15 +28,21 @@ export async function GET(req) {
 
   const col = await usersCol();
   const q = {};
-  if (search) q.$or = [{ psid: search }, { name: { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), $options: "i" } }];
+  if (search) {
+    q.$or = [
+      { psid: search },
+      { name: { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), $options: "i" } }
+    ];
+  }
 
   const total = await col.countDocuments(q);
   const items = await col.find(q).sort({ updatedAt: -1 }).skip(skip).limit(limit).toArray();
-  return Response.json({ page, limit, total, items });
+
+  const res = Response.json({ page, limit, total, items });
+  res.headers.set("Cache-Control", "no-store");
+  return res;
 }
 
-// Toggle verified/vip and notify user.
-// If verified switched ON → reset daily counter + send confirmation.
 export async function POST(req) {
   try {
     const { psid, verified, vip } = await req.json();
@@ -43,14 +54,21 @@ export async function POST(req) {
     const patch = { updatedAt: Date.now() };
     let notify = null;
 
+    // verified toggle
     if (typeof verified === "boolean") {
       patch.verified = verified;
-      if (verified && !cur?.verified) {
+      if (verified) {
+        // turning ON: reset daily window
         patch.dailyCount = 0;
         patch.dailyAt = null;
-        notify = "You're verified now! 🎉 Daily 100 chat unlocked (auto-reset each day).";
+        if (!cur?.verified) notify = "You're verified now! 🎉 Daily 100 chat unlocked (auto-reset each day).";
+      } else {
+        // turning OFF: keep counters as-is (they’ll be ignored by the webhook anyway)
+        if (cur?.verified) notify = "Verification removed. You’re back on the free tier.";
       }
     }
+
+    // vip toggle
     if (typeof vip === "boolean") {
       patch.vip = vip;
       if (vip) notify = "VIP enabled—unlimited access. 🚀";
@@ -58,9 +76,13 @@ export async function POST(req) {
     }
 
     await col.updateOne({ psid }, { $set: patch }, { upsert: true });
+    const updated = await col.findOne({ psid });
+
     if (notify) await sendText(psid, notify);
 
-    return Response.json({ ok: true });
+    const res = Response.json({ ok: true, user: updated });
+    res.headers.set("Cache-Control", "no-store");
+    return res;
   } catch (e) {
     console.error("[admin/users POST]", e);
     return new Response("Bad Request", { status: 400 });
