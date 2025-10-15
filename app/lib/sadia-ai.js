@@ -259,7 +259,7 @@ function normalizeKinship(out, { AMMU_MODE, ABBU_MODE }) {
   if (AMMU_MODE) out = out.replace(/\b(Maa|Mom|Mother)\b/gi, "Ammu");
   if (ABBU_MODE) out = out.replace(/\b(Dad|Baba|Father)\b/gi, "Abbu");
   // Any explicit "Sifat" in generated text → "Sadia-r Abbu"
-  out = out.replace(/\bSifat(?:\s+Hosen)?\b/gi, "Sadia-r Abbu");
+  out = out.replace(/\bSifat(?:\s+Hosen)?\b/gi, "Sifat");
   return out;
 }
 
