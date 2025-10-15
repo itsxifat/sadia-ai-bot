@@ -1,3 +1,4 @@
+// app/api/messenger/webhook/route.js
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
@@ -12,7 +13,6 @@ const AUTO_VERIFY_ON_CLAIM = (process.env.SADIA_AUTO_VERIFY_ON_CLAIM || "") === 
 const FREE_LIMIT = 10;
 const DAILY_LIMIT_VERIFIED = 100;
 
-function log(...a){ console.log("[WEBHOOK]", ...a); }
 function isEcho(evt){ return Boolean(evt.message?.is_echo); }
 
 // ── FB Send API
@@ -41,7 +41,7 @@ async function sendText(psid, text){ return fbSend({ recipient:{ id: psid }, mes
 async function humanPause(text){ const wpm=140; const ms=Math.min(2200, Math.max(500, ((String(text||"").split(/\s+/).length)/wpm)*60000)); await new Promise(r=>setTimeout(r,ms)); }
 
 async function sendFollowPrompt(psid){
-  const text = "Follow our Facebook Page to unlock full chat with Sadia 💚";
+  const text = "Follow our Facebook Page to unlock full chat with Sadia 💚\n\nFB Lite users: type -followed or -notfollowed";
   const buttons = [];
   if (PAGE_URL) buttons.push({ type: "web_url", url: PAGE_URL, title: "Open Page" });
   buttons.push({ type: "postback", title: "I’ve Followed ✅", payload: "FOLLOW_DONE" });
@@ -56,7 +56,7 @@ async function sendVerifiedInfo(psid){
 }
 
 // ======= FRESH-STATE CACHE (fix for Unverify) =======
-const MEM_TTL = 3000; // 3s cache; make 0 to disable
+const MEM_TTL = 3000; // 3s cache; set to 0 to disable
 const memCache = new Map();
 
 function blank(psid){
@@ -77,11 +77,7 @@ function blank(psid){
 async function users(){ return usersCol(); }
 function cacheSet(psid, state){ memCache.set(psid, { state, ts: Date.now() }); return state; }
 
-/**
- * Get a state fresh enough for auth/limits.
- * - If cache expired, load from DB.
- * - Otherwise compare DB.updatedAt with cache.updatedAt (cheap projection). If DB newer → reload.
- */
+/** Get a state fresh enough for auth/limits. */
 async function getState(psid){
   const cached = memCache.get(psid);
   const now = Date.now();
@@ -149,6 +145,16 @@ async function fetchMessengerProfile(psid){
   }catch(e){ console.error("[PROFILE] error", e); return null; }
 }
 
+// ===== Helpers: text commands for FB Lite =====
+function isFollowedCmd(s=""){
+  const t = s.trim().toLowerCase();
+  return t === "-followed" || t === "/followed" || t === "followed";
+}
+function isNotFollowedCmd(s=""){
+  const t = s.trim().toLowerCase();
+  return t === "-notfollowed" || t === "-notfolllowed" || t === "/notfollowed" || t === "notfollowed";
+}
+
 // ===== GET verify
 export async function GET(req){
   const { searchParams } = new URL(req.url);
@@ -169,7 +175,7 @@ export async function POST(req){
     for (const entry of body.entry || []){
       for (const evt of entry.messaging || []){
 
-        // Postbacks
+        // Postbacks (buttons on full Messenger)
         if (evt.postback?.payload && evt.sender?.id){
           const psid = evt.sender.id;
           const payload = evt.postback.payload;
@@ -183,7 +189,7 @@ export async function POST(req){
           }
           if (payload === "FOLLOW_NOT_YET"){
             await saveState(psid, { followClaim:"not_yet", followClaimAt: Date.now() });
-            await sendText(psid, "No pressure! You still have a few free replies. Follow anytime from the button. 🙂");
+            await sendText(psid, "No pressure! You still have a few free replies. Follow anytime. 🙂\n\nTip for FB Lite: type -followed or -notfollowed");
             continue;
           }
         }
@@ -196,12 +202,25 @@ export async function POST(req){
         if (!mid || !textIn) continue;
 
         let st = await getState(psid);
-        // belt & suspenders: if we *think* they're verified, re-get immediately (compares updatedAt)
-        if (st.verified) st = await getState(psid);
+        if (st.verified) st = await getState(psid); // double-check freshness
 
         if (Array.isArray(st.processedMids) && st.processedMids.includes(mid)) continue;
         const now = Date.now();
         if (st.cooldownUntil && now < st.cooldownUntil) continue;
+
+        // FB Lite text commands (do NOT count toward limits)
+        if (isFollowedCmd(textIn)) {
+          const patch = { followClaim:"claimed", followClaimAt: Date.now() };
+          if (AUTO_VERIFY_ON_CLAIM) patch.verified = true;
+          await saveState(psid, patch);
+          await sendText(psid, AUTO_VERIFY_ON_CLAIM ? `Awesome! Verified. Daily ${DAILY_LIMIT_VERIFIED} chats unlocked.` : "Claim received! We’ll review and unlock soon. 💚");
+          continue;
+        }
+        if (isNotFollowedCmd(textIn)) {
+          await saveState(psid, { followClaim:"not_yet", followClaimAt: Date.now() });
+          await sendText(psid, "Cool—take your time. You still have a few free replies.\nFB Lite tip: type -followed when you’re done.");
+          continue;
+        }
 
         // Fetch profile when missing (retry until hard error)
         if (!st.name && st.__profileError !== true) {
@@ -209,13 +228,14 @@ export async function POST(req){
           if (prof) st = await saveState(psid, prof);
         }
 
-        // First nudge
+        // First nudge (also mention text commands for Lite)
         if (!st.verified && !st.nudgeSent){
           await markSeen(psid); await sendTyping(psid, true);
-          await sendText(psid, "Hey! Prothome Page follow korle full access pabe. Tomar jonno 10 ta free reply on 😉");
+          await sendText(psid, "Hey! Prothome Page follow korle full access pabe. Tomar jonno 10 ta free reply on 😉\n\nFB Lite: type -followed or -notfollowed");
           await sendFollowPrompt(psid);
           await sendTyping(psid, false);
           st = await saveState(psid, { nudgeSent: true, processedMids: rememberMidLocal(st, mid) });
+          continue;
         } else {
           st = await saveState(psid, { processedMids: rememberMidLocal(st, mid) });
         }
