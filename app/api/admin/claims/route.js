@@ -1,4 +1,4 @@
-import { usersCol } from "../../../../lib/mongo.js";
+import { usersCol } from "../../../lib/mongo.js";
 
 export async function GET(req) {
   const url = new URL(req.url);
