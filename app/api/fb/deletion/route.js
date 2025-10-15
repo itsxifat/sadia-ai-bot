@@ -2,8 +2,8 @@
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-import { parseFacebookSignedRequest } from "../../../../lib/fb-signed.js";
-import { usersCol } from "../../../../lib/mongo.js"; // you already have this
+import { parseFacebookSignedRequest } from "../../../lib/fb-signed.js";
+import { usersCol } from "../../../lib/mongo.js"; // you already have this
 
 const APP_SECRET = process.env.FB_APP_SECRET || "";
 const BASE_URL   = process.env.PUBLIC_BASE_URL || "https://example.com";
