@@ -65,6 +65,37 @@ function followCard(psid) {
   });
 }
 
+// NEW: a plain text onboarding (for FB Lite & as instruction)
+// throttled by onboardAt (<= once per 6h)
+async function maybeShowOnboarding(psid) {
+  const col = await usersCol();
+  const u = await col.findOne({ psid }, { projection: { _id:0, verified:1, onboardAt:1 } }) || {};
+  if (u.verified) return;
+
+  const SIX_HOURS = 6 * 60 * 60 * 1000;
+  const now = Date.now();
+  if (u.onboardAt && (now - u.onboardAt) < SIX_HOURS) return;
+
+  const token = signPayload({ psid });
+  const link  = `${BASE_URL}/claim-info?t=${encodeURIComponent(token)}`;
+
+  const txt = [
+    "👋 To unlock full chat with Sadia:",
+    "• Tap: I’ve Followed ✅ or Not Yet (buttons below)",
+    "• Or type: -followed  /  -notfollowed",
+    "• Share name: -name Your Name",
+    "• Share profile link: -profile https://your-profile",
+    "",
+    `Or fill this form: ${link}`,
+  ].join("\n");
+
+  // Send both (text + card). Lite users will at least see the text.
+  await sendText(psid, txt);
+  await followCard(psid);
+
+  await col.updateOne({ psid }, { $set: { onboardAt: now, updatedAt: now } }, { upsert: true });
+}
+
 async function humanPause(text) {
   const wpm = 140;
   const ms = Math.min(2200, Math.max(500, ((String(text||"").split(/\s+/).length)/wpm)*60000));
@@ -174,11 +205,14 @@ export async function POST(req) {
           const col = await usersCol();
           const u = (await col.findOne({ psid }, { projection: { _id:0 } })) || {};
           const isAdm = ADMIN_SET.has(psid) || !!u.isAdmin;
+          const token = signPayload({ psid });
+          const link  = `${BASE_URL}/claim-info?t=${encodeURIComponent(token)}`;
           const lines = [
             "Commands:",
             "• -followed / -notfollowed",
             "• -name <Your Name>",
             "• -profile <https://your.profile>",
+            `• Web form: ${link}`,
             ...(isAdm ? [
               "• -ban <psid?>      (admin)",
               "• -unban <psid?>    (admin)",
@@ -205,9 +239,8 @@ export async function POST(req) {
 
           const banFlag = /^-ban\b/i.test(textIn);
           const m = textIn.match(/^(?:-ban|-unban)\s+(\d{5,})/i);
-          const target = m ? m[1] : psid; // allow targeting, default to self-chat user
+          const target = m ? m[1] : psid;
 
-          // protections: root admins & admins cannot be banned; admins cannot ban root admins; you also cannot ban yourself
           const targetIsRoot = ADMIN_SET.has(target);
           const col = await usersCol();
           const tu = await col.findOne({ psid: target }, { projection: { _id:0, isAdmin:1 } });
@@ -251,7 +284,6 @@ export async function POST(req) {
 
           if (ADMIN_SET.has(target)) { await sendText(psid, "Root admins cannot be demoted."); continue; }
           if (target === psid && ADMIN_SET.size === 0) {
-            // you may allow self-demote; but safer to block
             await sendText(psid, "You can’t demote yourself."); continue;
           }
 
@@ -268,13 +300,30 @@ export async function POST(req) {
         await markSeen(psid);
         await sendTyping(psid, true);
 
-        // gate (handles banned/limits)
+        // GATE (handles banned/limits and increments counters)
         const gate = await touchAndGateUser(psid);
+
+        // If the user is unverified (regardless of limit), show onboarding (once/6h) so they always see buttons & commands.
+        if (!gate.user?.verified) {
+          await maybeShowOnboarding(psid);
+        }
+
         if (!gate.allowLLM) {
           await sendTyping(psid, false);
           if (gate.reason === "banned") {
             await sendText(psid, "Access is currently restricted.");
           } else if (gate.reason === "need_follow") {
+            // Limit reached without follow → show reminder + buttons + commands + link
+            const token = signPayload({ psid });
+            const link  = `${BASE_URL}/claim-info?t=${encodeURIComponent(token)}`;
+            const msg   = [
+              "Follow required to continue chatting 💚",
+              "Type: -followed  or  -notfollowed",
+              "Share name: -name Your Name",
+              "Share profile: -profile https://your-profile",
+              `Or fill this form: ${link}`,
+            ].join("\n");
+            await sendText(psid, msg);
             await followCard(psid);
           } else if (gate.reason === "daily_limit") {
             await sendText(psid, "Daily 100 chat limit reached 🙂 Try again after midnight (Dhaka).");
@@ -282,6 +331,7 @@ export async function POST(req) {
           continue;
         }
 
+        // Below: Allowed to call LLM (includes unverified users within 10-free window)
         let reply = await generateReplyLLM({ psid, userText: textIn });
         if (reply == null) {
           const soft = "Ekto tech jhamela hocche. Abar chesta kortesi 🙂";
