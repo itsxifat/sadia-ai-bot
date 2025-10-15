@@ -1,94 +1,211 @@
-// app/lib/yt.js
-import ytdl from "ytdl-core";
-import { put } from "@vercel/blob";
-import fs from "node:fs";
-import path from "node:path";
-import { randomUUID } from "node:crypto";
+// lib/yt.js
+// Robust YouTube → audio uploader for Messenger
+// Requires: npm i ytdl-core ytpl
+// Also set: BLOB_READ_WRITE_TOKEN (Vercel Blob R/W token)
 
-const MAX_SECONDS = 8 * 60;          // 8 minutes
-const MAX_BYTES   = 20 * 1024 * 1024; // 20 MB
+const MAX_SECONDS = 12 * 60;            // 12 minutes
+const MAX_BYTES   = 24 * 1024 * 1024;   // ~24 MB for safety
+
+function normalizeWatchUrlFromId(videoId) {
+  return `https://www.youtube.com/watch?v=${videoId}`;
+}
+
+function pickFirst(paramMap, ...names) {
+  for (const n of names) {
+    if (paramMap.get(n)) return paramMap.get(n);
+  }
+  return null;
+}
 
 /**
- * onStage: (stage, payload?) => void
- * Stages: "info", "download_start", "download_progress", "download_done",
- *         "upload_start", "upload_done"
+ * normalizeYouTubeUrlAny(input)
+ *  - Accepts: shorts, youtu.be, watch URLs, “si” params, timestamps, etc.
+ *  - If a playlist-only URL is provided, resolves to the **first video** in the playlist.
+ *  - Returns a normal watch URL.
+ *  - Throws coded errors on invalid URLs or unresolvable playlists.
  */
-export async function ytFetchAndUpload(youtubeUrl, onStage) {
-  const stage = (s, p) => { try { onStage && onStage(s, p); } catch {} };
+export async function normalizeYouTubeUrlAny(input) {
+  const ytpl = (await import("ytpl")).default;
 
-  if (!ytdl.validateURL(youtubeUrl)) {
-    throw new Error("invalid_youtube_url");
+  let u;
+  try {
+    u = new URL(input);
+  } catch {
+    const err = new Error("invalid_youtube_url");
+    err.code = "invalid_youtube_url";
+    throw err;
+  }
+  const host = u.hostname.toLowerCase();
+
+  // handle youtu.be/<id>
+  if (host === "youtu.be") {
+    const id = u.pathname.replace(/^\/+/, ""); // after slash
+    if (id) return normalizeWatchUrlFromId(id);
   }
 
-  const info = await ytdl.getInfo(youtubeUrl);
-  const title = (info?.videoDetails?.title || "audio").slice(0, 100);
-  const lengthSec = parseInt(info?.videoDetails?.lengthSeconds || "0", 10);
-
-  stage("info", { title, lengthSec });
-
-  if (lengthSec > MAX_SECONDS) {
-    throw new Error("too_long");
+  // shorts → watch
+  if (host.includes("youtube.com") && u.pathname.startsWith("/shorts/")) {
+    const id = u.pathname.split("/")[2];
+    if (id) return normalizeWatchUrlFromId(id);
   }
 
-  const format =
-    ytdl.chooseFormat(info.formats, {
-      quality: "highestaudio",
-      filter: (f) =>
-        f.hasAudio &&
-        !f.hasVideo &&
-        (f.container === "mp4" || f.container === "m4a" || f.mimeType?.includes("mp4")),
-    }) ||
-    ytdl.chooseFormat(info.formats, { quality: "highestaudio", filter: "audioonly" });
+  // standard watch link: pick v= if present
+  if (host.includes("youtube.com")) {
+    const v = pickFirst(u.searchParams, "v");
+    if (v) return normalizeWatchUrlFromId(v);
 
-  if (!format) throw new Error("no_audio_format");
-
-  const ext = format.container === "webm" ? "webm" : format.container || "m4a";
-  const contentType = ext === "webm" ? "audio/webm" : "audio/mp4";
-  const filename = `${randomUUID()}.${ext}`;
-  const tmpPath = path.join("/tmp", filename);
-
-  stage("download_start");
-
-  let written = 0;
-  await new Promise((resolve, reject) => {
-    const out = fs.createWriteStream(tmpPath);
-    const stream = ytdl.downloadFromInfo(info, { format });
-
-    let lastEmit = 0;
-    stream.on("data", (chunk) => {
-      written += chunk.length;
-      if (written > MAX_BYTES) {
-        stream.destroy(new Error("file_too_large"));
+    // playlist only? → resolve first item using ytpl
+    const listId = pickFirst(u.searchParams, "list", "playlist", "p");
+    if (listId) {
+      try {
+        // ytpl returns items in order; pageSize=1 gets just the first
+        const pl = await ytpl(listId, { pages: 1 });
+        const first = pl?.items?.[0]?.id;
+        if (first) return normalizeWatchUrlFromId(first);
+      } catch (e) {
+        // fall through to coded error
       }
-      // throttle progress emits to every ~1s
-      const now = Date.now();
-      if (now - lastEmit > 1000) {
-        lastEmit = now;
-        stage("download_progress", { bytes: written, mb: (written / (1024 * 1024)).toFixed(1) });
+      const err = new Error("playlist_first_failed");
+      err.code = "playlist_first_failed";
+      throw err;
+    }
+  }
+
+  // if we get here and still no watch form, try returning raw if it’s a plausible yt URL
+  if (/youtube\.com|youtu\.be/i.test(u.hostname)) {
+    return u.toString();
+  }
+
+  const err = new Error("invalid_youtube_url");
+  err.code = "invalid_youtube_url";
+  throw err;
+}
+
+async function uploadToVercelBlob(buf, filenameExt = "webm") {
+  const token = process.env.BLOB_READ_WRITE_TOKEN || "";
+  if (!token) {
+    const err = new Error("upload_failed");
+    err.code = "upload_failed";
+    throw err;
+  }
+  const key = `yt-${Date.now()}-${Math.random().toString(36).slice(2)}.${filenameExt}`;
+  const endpoint = `https://blob.vercel-storage.com/${encodeURIComponent(key)}?token=${encodeURIComponent(token)}`;
+
+  const res = await fetch(endpoint, {
+    method: "PUT",
+    headers: { "Content-Type": "application/octet-stream" },
+    body: buf
+  });
+  if (!res.ok) {
+    const err = new Error("upload_failed");
+    err.code = "upload_failed";
+    throw err;
+  }
+  return `https://blob.vercel-storage.com/${encodeURIComponent(key)}`;
+}
+
+/**
+ * ytFetchAndUpload(url, onStage?)
+ *  - url: any YouTube URL (video | shorts | youtu.be | playlist)
+ *  - onStage: (stage, payload) => void
+ *     stages: info, download_start, download_progress, download_done, upload_start, upload_done
+ *  returns: { url, title, lengthSec }
+ */
+export async function ytFetchAndUpload(inputUrl, onStage) {
+  const ytdl = await import("ytdl-core");
+
+  // Normalize & resolve playlist → first video when necessary
+  const url = await normalizeYouTubeUrlAny(inputUrl);
+
+  if (!ytdl.validateURL(url)) {
+    const err = new Error("invalid_youtube_url");
+    err.code = "invalid_youtube_url";
+    throw err;
+  }
+
+  // Fetch info
+  let info;
+  try {
+    info = await ytdl.getInfo(url);
+  } catch (e) {
+    const msg = String(e?.message || "").toLowerCase();
+    let code = "download_failed";
+    if (msg.includes("age")) code = "age_restricted";
+    else if (msg.includes("not available in your country")) code = "region_blocked";
+    const err = new Error(code);
+    err.code = code;
+    throw err;
+  }
+
+  const title = info.videoDetails?.title || "Unknown title";
+  const lengthSec = Number(info.videoDetails?.lengthSeconds || 0);
+  if (!Number.isFinite(lengthSec) || lengthSec <= 0) {
+    const err = new Error("download_failed");
+    err.code = "download_failed";
+    throw err;
+  }
+  if (lengthSec > MAX_SECONDS) {
+    const err = new Error("too_long");
+    err.code = "too_long";
+    throw err;
+  }
+
+  // Prefer audio-only formats
+  const format = (await import("ytdl-core")).chooseFormat(info.formats, {
+    quality: "highestaudio",
+    filter: "audioonly"
+  });
+  if (!format) {
+    const err = new Error("no_audio_format");
+    err.code = "no_audio_format";
+    throw err;
+  }
+
+  onStage?.("info", { title, lengthSec });
+
+  // Download → buffer (guard with MAX_BYTES)
+  onStage?.("download_start");
+  const stream = (await import("ytdl-core")).default(url, {
+    quality: "highestaudio",
+    filter: "audioonly",
+    dlChunkSize: 512 * 1024
+  });
+
+  let received = 0;
+  const chunks = [];
+  const ext = /mp4|m4a/i.test(format.container || "") ? "m4a" : "webm";
+
+  await new Promise((resolve, reject) => {
+    stream.on("data", (c) => {
+      received += c.length;
+      if (received > MAX_BYTES) {
+        const err = new Error("file_too_large");
+        err.code = "file_too_large";
+        stream.destroy(err);
+        return;
+      }
+      chunks.push(c);
+      // progress ping roughly each MB
+      if (received % (1024 * 1024) < c.length) {
+        const mb = Math.round(received / (1024 * 1024));
+        onStage?.("download_progress", { mb });
       }
     });
-
-    stream.on("error", reject);
-    out.on("error", reject);
-    out.on("finish", resolve);
-    stream.pipe(out);
+    stream.once("end", resolve);
+    stream.once("error", () => {
+      const err = new Error("download_failed");
+      err.code = "download_failed";
+      reject(err);
+    });
   });
 
-  stage("download_done", { bytes: written });
+  onStage?.("download_done");
 
-  // Upload to Vercel Blob
-  stage("upload_start");
-  const data = await fs.promises.readFile(tmpPath);
-  const blob = await put(`yt/${filename}`, data, {
-    access: "public",
-    contentType,
-    addRandomSuffix: false,
-  });
+  const buf = Buffer.concat(chunks);
 
-  stage("upload_done", { url: blob.url });
+  onStage?.("upload_start");
+  const publicUrl = await uploadToVercelBlob(buf, ext);
+  onStage?.("upload_done");
 
-  // cleanup
-  fs.promises.unlink(tmpPath).catch(() => {});
-
-  return { url: blob.url, title, lengthSec, contentType };
+  return { url: publicUrl, title, lengthSec };
 }
