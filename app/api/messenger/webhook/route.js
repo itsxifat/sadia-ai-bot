@@ -5,45 +5,41 @@ export const dynamic = "force-dynamic";
 import { generateReplyLLM } from "../../../lib/sadia-ai.js";
 import { usersCol } from "../../../lib/mongo.js";
 import { touchAndGateUser } from "../../../lib/user-gate.js";
+import { signPayload } from "../../../lib/sign.js";
 
 const PAGE_TOKEN   = process.env.MESSENGER_PAGE_TOKEN || "";
 const VERIFY_TOKEN = process.env.MESSENGER_VERIFY_TOKEN || "";
+const BASE_URL     = (process.env.PUBLIC_BASE_URL || "https://example.com").replace(/\/+$/,"");
+
+// Bootstrap root-admins (cannot be banned/demoted)
+const ADMIN_SET = new Set(
+  (process.env.ADMIN_PSIDS || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean)
+);
 
 function log(...a) { console.log("[WEBHOOK]", ...a); }
 function isEcho(evt) { return Boolean(evt.message?.is_echo); }
 
 async function fbSend(body) {
-  if (!PAGE_TOKEN) {
-    console.error("[SendAPI error] Missing MESSENGER_PAGE_TOKEN");
-    return false;
-  }
+  if (!PAGE_TOKEN) { console.error("[SendAPI] Missing MESSENGER_PAGE_TOKEN"); return false; }
   const url = `https://graph.facebook.com/v24.0/me/messages?access_token=${encodeURIComponent(PAGE_TOKEN)}`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    cache: "no-store",
-  });
+  const res = await fetch(url, { method: "POST", headers: { "Content-Type":"application/json" }, body: JSON.stringify(body), cache: "no-store" });
   if (!res.ok) {
-    const txt = await res.text().catch(()=>"");
+    const txt = await res.text().catch(()=> "");
     console.error("[SendAPI error]", res.status, txt, "BODY:", JSON.stringify(body));
   }
   return res.ok;
 }
-
-async function sendSenderAction(psid, action) {
-  return fbSend({ recipient: { id: psid }, sender_action: action });
-}
-async function markSeen(psid)  { return sendSenderAction(psid, "mark_seen"); }
-async function sendTyping(psid, on = true) { return sendSenderAction(psid, on ? "typing_on" : "typing_off"); }
-async function sendText(psid, text) {
-  const msg = String(text || "").slice(0, 1200);
-  return fbSend({ recipient: { id: psid }, message: { text: msg } });
-}
+async function sendSenderAction(psid, action) { return fbSend({ recipient: { id: psid }, sender_action: action }); }
+async function markSeen(psid){ return sendSenderAction(psid, "mark_seen"); }
+async function sendTyping(psid, on=true){ return sendSenderAction(psid, on ? "typing_on" : "typing_off"); }
+async function sendText(psid, text){ return fbSend({ recipient:{ id: psid }, message:{ text: String(text||"").slice(0,1200) } }); }
 
 function followCard(psid) {
-  // Button template + command fallback text
-  const text = "Follow our Facebook Page to unlock full chat with Sadia 💚\n\nWrite: -followed  or  -notfollowed";
+  const token = signPayload({ psid });
+  const text = "Follow our Page to unlock full chat with Sadia 💚\n\nType: -followed  or  -notfollowed\nOr share your name & profile link:";
   return fbSend({
     recipient: { id: psid },
     message: {
@@ -54,7 +50,14 @@ function followCard(psid) {
           text,
           buttons: [
             { type: "postback", title: "I’ve Followed ✅", payload: "FOLLOW_CLAIMED" },
-            { type: "postback", title: "Not Yet",        payload: "FOLLOW_NOTYET" }
+            { type: "postback", title: "Not Yet",          payload: "FOLLOW_NOTYET" },
+            {
+              type: "web_url",
+              title: "Share Name & Profile",
+              url: `${BASE_URL}/claim-info?t=${encodeURIComponent(token)}`,
+              messenger_extensions: true,
+              webview_height_ratio: "tall"
+            }
           ]
         }
       }
@@ -68,16 +71,10 @@ async function humanPause(text) {
   await new Promise(r => setTimeout(r, ms));
 }
 
-/** ephemeral in-memory mid dedupe */
 const psidState = new Map();
 function getState(psid) {
   if (!psidState.has(psid)) {
-    psidState.set(psid, {
-      processedMids: new Set(),
-      lastReply: null,
-      lastReplyAt: 0,
-      cooldownUntil: 0,
-    });
+    psidState.set(psid, { processedMids: new Set(), lastReply: null, lastReplyAt: 0, cooldownUntil: 0 });
   }
   return psidState.get(psid);
 }
@@ -88,26 +85,27 @@ function rememberMid(psid, mid) {
   if (typeof t.unref === "function") t.unref();
 }
 
-/* ===== Verification (GET) ===== */
+async function isAdmin(psid) {
+  if (ADMIN_SET.has(psid)) return true;
+  const col = await usersCol();
+  const u = await col.findOne({ psid }, { projection: { _id:0, isAdmin:1 } });
+  return !!u?.isAdmin;
+}
+
+/* ===== Verify webhook (GET) ===== */
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
   const mode = searchParams.get("hub.mode");
   const token = searchParams.get("hub.verify_token");
   const challenge = searchParams.get("hub.challenge");
-
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    return new Response(challenge, { status: 200 });
-  }
+  if (mode === "subscribe" && token === VERIFY_TOKEN) return new Response(challenge, { status: 200 });
   return new Response("Forbidden", { status: 403 });
 }
 
 /* ===== Events (POST) ===== */
 export async function POST(req) {
   try {
-    if (!PAGE_TOKEN) {
-      console.error("[WEBHOOK] Missing MESSENGER_PAGE_TOKEN");
-      return new Response("Server misconfigured", { status: 500 });
-    }
+    if (!PAGE_TOKEN) { console.error("[WEBHOOK] Missing MESSENGER_PAGE_TOKEN"); return new Response("Server misconfigured", { status: 500 }); }
 
     const body = await req.json();
     if (body.object !== "page") return new Response("Not a page object", { status: 404 });
@@ -117,123 +115,196 @@ export async function POST(req) {
         const psid = evt.sender?.id;
         if (!psid) continue;
 
-        // Handle Postbacks (buttons)
+        // Handle postbacks
         if (evt.postback?.payload) {
           const payload = evt.postback.payload;
+          const col = await usersCol();
           if (payload === "FOLLOW_CLAIMED") {
-            const col = await usersCol();
-            await col.updateOne(
-              { psid },
-              { $set: { followClaim: "claimed", followClaimAt: Date.now(), updatedAt: Date.now() } },
-              { upsert: true }
-            );
-            await sendText(psid, "Nice! Our team will verify you soon. For now you still have 10 free replies if not verified yet. 💚");
+            await col.updateOne({ psid }, { $set: { followClaim: "claimed", followClaimAt: Date.now(), updatedAt: Date.now() } }, { upsert: true });
+            await sendText(psid, "Got it! Our team will verify you soon. 💚");
             continue;
           }
           if (payload === "FOLLOW_NOTYET") {
-            const col = await usersCol();
-            await col.updateOne(
-              { psid },
-              { $set: { followClaim: "declined", followClaimAt: Date.now(), updatedAt: Date.now() } },
-              { upsert: true }
-            );
-            await sendText(psid, "Cool—take your time. You have 10 free replies before follow is required. 🙂");
+            await col.updateOne({ psid }, { $set: { followClaim: "declined", followClaimAt: Date.now(), updatedAt: Date.now() } }, { upsert: true });
+            await sendText(psid, "Cool—take your time. You’ll get 10 free replies without follow.");
             continue;
           }
         }
 
-        // Messages (ignore echos and non-text)
         if (isEcho(evt)) continue;
-
-        const mid    = evt.message?.mid;
+        const mid = evt.message?.mid;
         const textIn = evt.message?.text?.trim();
-        if (!mid || !textIn) {
-          log("non-text or missing mid; ignoring", { psid, hasText: !!textIn, hasMid: !!mid });
-          continue;
-        }
-
+        if (!mid || !textIn) { log("non-text or missing mid; ignoring", { psid, hasText: !!textIn, hasMid: !!mid }); continue; }
         const st = getState(psid);
         if (st.processedMids.has(mid)) { log("dup mid; skip", mid); continue; }
         rememberMid(psid, mid);
 
-        // Commands for FB Lite:
+        // -------- FB Lite friendly commands (user info) --------
         if (/^-followed\b/i.test(textIn)) {
           const col = await usersCol();
-          await col.updateOne(
-            { psid },
-            { $set: { followClaim: "claimed", followClaimAt: Date.now(), updatedAt: Date.now() } },
-            { upsert: true }
-          );
-          await sendText(psid, "Got it! We’ll verify you soon. 💚");
+          await col.updateOne({ psid }, { $set: { followClaim: "claimed", followClaimAt: Date.now(), updatedAt: Date.now() } }, { upsert: true });
+          await sendText(psid, "Noted. We’ll verify you soon. 💚");
           continue;
         }
-        if (/^-notfollowed\b/i.test(textIn) || /^-notfol+owed\b/i.test(textIn)) {
+        if (/^-notfoll+owed\b/i.test(textIn) || /^-notfollowed\b/i.test(textIn)) {
           const col = await usersCol();
-          await col.updateOne(
-            { psid },
-            { $set: { followClaim: "declined", followClaimAt: Date.now(), updatedAt: Date.now() } },
-            { upsert: true }
-          );
-          await sendText(psid, "No worries. You still have 10 free replies, then follow is required.");
+          await col.updateOne({ psid }, { $set: { followClaim: "declined", followClaimAt: Date.now(), updatedAt: Date.now() } }, { upsert: true });
+          await sendText(psid, "All good. You still have 10 free replies without follow.");
+          continue;
+        }
+        if (/^-name\s+(.+)/i.test(textIn)) {
+          const name = textIn.replace(/^-name\s+/i, "").trim().slice(0, 80);
+          if (name.length < 2) { await sendText(psid, "Name ta arektu boro din 🙂"); continue; }
+          const col = await usersCol();
+          await col.updateOne({ psid }, { $set: { name, updatedAt: Date.now() } }, { upsert: true });
+          await sendText(psid, `Saved your name as: ${name}`);
+          continue;
+        }
+        if (/^-profile\s+(\S+)/i.test(textIn)) {
+          const url = textIn.replace(/^-profile\s+/i, "").trim();
+          if (!/^https?:\/\/\S{3,200}$/i.test(url)) { await sendText(psid, "Profile URL thik na mone hocche. https:// diye din 🙂"); continue; }
+          const col = await usersCol();
+          await col.updateOne({ psid }, { $set: { profileUrl: url, updatedAt: Date.now() } }, { upsert: true });
+          await sendText(psid, "Profile link saved. ✅");
           continue;
         }
 
-        const now = Date.now();
-        if (st.cooldownUntil && now < st.cooldownUntil) {
-          log("cooldown active; suppress reply");
+        // ---------------- Admin commands ----------------
+        if (/^-help\b/i.test(textIn)) {
+          const col = await usersCol();
+          const u = (await col.findOne({ psid }, { projection: { _id:0 } })) || {};
+          const isAdm = ADMIN_SET.has(psid) || !!u.isAdmin;
+          const lines = [
+            "Commands:",
+            "• -followed / -notfollowed",
+            "• -name <Your Name>",
+            "• -profile <https://your.profile>",
+            ...(isAdm ? [
+              "• -ban <psid?>      (admin)",
+              "• -unban <psid?>    (admin)",
+              "• -addadmin <psid>  (admin)",
+              "• -deladmin <psid>  (admin)"
+            ] : []),
+            "",
+            "Your status:",
+            `• verified: ${u.verified ? "yes" : "no"}`,
+            `• vip: ${u.vip ? "yes" : "no"}`,
+            `• banned: ${u.banned ? "yes" : "no"}`,
+            `• admin: ${isAdm ? "yes" : "no"}`,
+            `• free used: ${u.freeCount || 0} / 10`,
+            `• daily used: ${u.dailyCount || 0} / 100`
+          ];
+          await sendText(psid, lines.join("\n"));
           continue;
         }
+
+        // -ban / -unban
+        if (/^-(?:ban|unban)\b/i.test(textIn)) {
+          const isAdm = await isAdmin(psid);
+          if (!isAdm) { await sendText(psid, "This command is admin-only."); continue; }
+
+          const banFlag = /^-ban\b/i.test(textIn);
+          const m = textIn.match(/^(?:-ban|-unban)\s+(\d{5,})/i);
+          const target = m ? m[1] : psid; // allow targeting, default to self-chat user
+
+          // protections: root admins & admins cannot be banned; admins cannot ban root admins; you also cannot ban yourself
+          const targetIsRoot = ADMIN_SET.has(target);
+          const col = await usersCol();
+          const tu = await col.findOne({ psid: target }, { projection: { _id:0, isAdmin:1 } });
+          const targetIsAdmin = targetIsRoot || !!tu?.isAdmin;
+
+          if (banFlag) {
+            if (target === psid) { await sendText(psid, "You can’t ban yourself."); continue; }
+            if (targetIsAdmin) { await sendText(psid, "Admins cannot be banned."); continue; }
+          }
+
+          await col.updateOne(
+            { psid: target },
+            { $set: { banned: banFlag, updatedAt: Date.now() } },
+            { upsert: true }
+          );
+          await sendText(psid, `${banFlag ? "Banned" : "Unbanned"}: ${target}`);
+          continue;
+        }
+
+        // -addadmin <psid>
+        if (/^-addadmin\s+(\d{5,})/i.test(textIn)) {
+          const isAdm = await isAdmin(psid);
+          if (!isAdm) { await sendText(psid, "This command is admin-only."); continue; }
+          const m = textIn.match(/^-addadmin\s+(\d{5,})/i);
+          const target = m?.[1];
+          if (!target) { await sendText(psid, "Usage: -addadmin <psid>"); continue; }
+
+          const col = await usersCol();
+          await col.updateOne({ psid: target }, { $set: { isAdmin: true, banned: false, updatedAt: Date.now() } }, { upsert: true });
+          await sendText(psid, `Admin added: ${target}`);
+          continue;
+        }
+
+        // -deladmin <psid>
+        if (/^-deladmin\s+(\d{5,})/i.test(textIn)) {
+          const isAdm = await isAdmin(psid);
+          if (!isAdm) { await sendText(psid, "This command is admin-only."); continue; }
+          const m = textIn.match(/^-deladmin\s+(\d{5,})/i);
+          const target = m?.[1];
+          if (!target) { await sendText(psid, "Usage: -deladmin <psid>"); continue; }
+
+          if (ADMIN_SET.has(target)) { await sendText(psid, "Root admins cannot be demoted."); continue; }
+          if (target === psid && ADMIN_SET.size === 0) {
+            // you may allow self-demote; but safer to block
+            await sendText(psid, "You can’t demote yourself."); continue;
+          }
+
+          const col = await usersCol();
+          await col.updateOne({ psid: target }, { $set: { isAdmin: false, updatedAt: Date.now() } }, { upsert: true });
+          await sendText(psid, `Admin removed: ${target}`);
+          continue;
+        }
+        // ---------------- end admin commands ----------------
+
+        const now = Date.now();
+        if (st.cooldownUntil && now < st.cooldownUntil) { log("cooldown active; suppress reply"); continue; }
 
         await markSeen(psid);
         await sendTyping(psid, true);
 
-        // Gatekeeping: limits and verification
+        // gate (handles banned/limits)
         const gate = await touchAndGateUser(psid);
-
         if (!gate.allowLLM) {
           await sendTyping(psid, false);
-
-          if (gate.reason === "need_follow") {
-            // Always show the card (no spam: only when message arrives)
+          if (gate.reason === "banned") {
+            await sendText(psid, "Access is currently restricted.");
+          } else if (gate.reason === "need_follow") {
             await followCard(psid);
           } else if (gate.reason === "daily_limit") {
-            await sendText(psid, "Daily 100 chat limit reached for today 🙂 Try again after midnight (Dhaka).");
+            await sendText(psid, "Daily 100 chat limit reached 🙂 Try again after midnight (Dhaka).");
           }
           continue;
         }
 
-        // Call LLM normally
         let reply = await generateReplyLLM({ psid, userText: textIn });
-
         if (reply == null) {
-          const soft = "Ekto tech jhamela hocche. Abar chesta kortesi, thik hoye jabe 🙂";
+          const soft = "Ekto tech jhamela hocche. Abar chesta kortesi 🙂";
           await humanPause(soft);
           await sendText(psid, soft);
-          st.lastReply = soft;
-          st.lastReplyAt = now;
-          st.cooldownUntil = now + 45_000;
+          st.lastReply = soft; st.lastReplyAt = now; st.cooldownUntil = now + 45_000;
           await sendTyping(psid, false);
           continue;
         }
 
-        // De-dup within 30s
         if (st.lastReply === reply && (now - st.lastReplyAt) < 30_000) {
-          log("suppress duplicate reply within 30s");
-          await sendTyping(psid, false);
-          continue;
+          log("suppress duplicate reply within 30s"); await sendTyping(psid, false); continue;
         }
 
         await humanPause(reply);
         await sendText(psid, reply);
         await sendTyping(psid, false);
-
-        st.lastReply = reply;
-        st.lastReplyAt = Date.now();
+        st.lastReply = reply; st.lastReplyAt = Date.now();
       }
     }
     return new Response("EVENT_RECEIVED", { status: 200 });
   } catch (e) {
     console.error("[WEBHOOK error]", e);
-    return new Response("OK", { status: 200 }); // prevent FB retries
+    return new Response("OK", { status: 200 });
   }
 }
